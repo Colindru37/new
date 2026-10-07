@@ -1,0 +1,628 @@
+"""
+validate.py -- structural + link validator for generated Blue Prism XML.
+
+Checks each *.xml in a directory (default: ./out) for:
+  * well-formed XML with a <process> root
+  * no broken flow links: every onsuccess / ontrue / onfalse points at a real
+    stageid in the same file; no duplicate stageids
+  * subsheet declarations and SubSheetInfo stages agree (every page is both
+    declared and defined)
+  * Code Options / ProcessInfo shape: no <globalcode>/<code>/<references>/<imports>
+    as direct children of <process>; no <namespaces> anywhere (must be <imports>)
+  * internal name does not carry the 'BPA Object - ' / 'BPA Process - ' prefix
+  * every output stage="X" names a Data/Collection stage on the SAME page
+    (the classic "null-reference at the Action stage, no other clue")
+  * collections are type="Collection" stages, ForEach <loopdata> names one,
+    LoopStart/LoopEnd groupids pair up
+  * unquoted text literals in input expressions (use lit())
+  * cross-object calls: when the called object is ALSO in the directory, the
+    action must exist as a published page and every passed input name must be
+    one of that page's Start inputs (exact string match, like Blue Prism)
+  * [Item] references that resolve to no data item on the page (WARN)
+  * non-ASCII in names/narratives (WARN -- garbles on import)
+
+Run:  python validate.py [directory] [--flow] [--estate]
+Exit code is 0 when everything is clean, 1 otherwise (CI-friendly).
+Pass --flow (or -f) to also print a resolved link report (stage --tag--> target)
+so you can eyeball where decisions/gotos/loops actually go; links landing on an
+End stage are marked *(End) to expose mistyped targets that silently fell back.
+Pass --strict to enforce the estate review checklist mechanically: unique stage names
+per page, no generic/numbered/++ names, no unreachable stages or dead ends, no unused
+data items, explicit initial values on flags/numbers, no leftover breakpoints,
+Choice/Wait pairing, populated exception types, clean boolean expressions. Use it on
+everything GENERATED; on legacy exports it lists the debt rather than blocking.
+Pass --estate for new estate-native work. It checks objective mandatory
+conventions; omit it only for a documented project-compatible exception.
+"""
+import os, sys, glob, re
+import xml.etree.ElementTree as ET
+
+LIT_OK = [
+    re.compile(r'^-?\d+(\.\d+)?$'),                    # number
+    re.compile(r'^(True|False)$', re.I),               # flag
+    re.compile(r'^[A-Za-z][A-Za-z0-9]*\([^()]*\)'),    # function call, e.g. Today()
+]
+REF_RE = re.compile(r'\[([^\[\]]+)\]')
+QUOTED_RE = re.compile(r'"(?:[^"]|"")*"')
+
+
+def page_of(st):
+    ss = st.find('subsheetid')
+    return ss.text.strip() if ss is not None and ss.text else None   # None = main page
+
+
+def bad_literal(e):
+    e = (e or '').strip()
+    if not e:
+        return False
+    if e.startswith('[') or e.startswith('"') or e.startswith('&quot;'):
+        return False
+    return not any(r.match(e) for r in LIT_OK)
+
+
+def load(fp):
+    with open(fp, 'r', encoding='utf-8') as f:
+        raw = f.read()
+    root = ET.fromstring(raw)
+    # Blue Prism exports often carry a default xmlns; strip it or every 'stage' search is empty
+    for el in root.iter():
+        if isinstance(el.tag, str) and '}' in el.tag:
+            el.tag = el.tag.split('}', 1)[1]
+    return root
+
+
+def object_catalogue(roots):
+    """name -> {page name -> (published, [start input names])} for every object in dir."""
+    cat = {}
+    for root in roots.values():
+        if root.tag != 'process' or root.get('type') != 'object':
+            continue
+        pub = {}
+        for ss in root.iter('subsheet'):
+            nm = (ss.findtext('name') or '').strip()
+            pub[ss.get('subsheetid')] = (nm, (ss.get('published') or '').lower() == 'true')
+        pages = {}
+        for st in root.iter('stage'):
+            if st.get('type') != 'Start':
+                continue
+            sid = page_of(st)
+            if sid not in pub:
+                continue
+            nm, published = pub[sid]
+            ins = [i.get('name') for i in st.iter('input')]
+            pages[nm] = (published, ins)
+        cat[root.get('name')] = pages
+    return cat
+
+
+# ---------------------------------------------------------------------------
+# --strict: the estate review checklist / anti-pattern list, made mechanical.
+# Sources: process conventions s.29 + s.31, object conventions s.10 + s.11.
+# ---------------------------------------------------------------------------
+FLOW_TYPES = {'Start', 'End', 'Action', 'Code', 'Decision', 'Calculation', 'MultipleCalculation',
+              'LoopStart', 'LoopEnd', 'SubSheet', 'Exception', 'Recover', 'Resume', 'Anchor',
+              'ChoiceStart', 'ChoiceEnd', 'WaitStart', 'WaitEnd', 'Navigate', 'Read', 'Write',
+              'Alert', 'Skill'}
+TERMINAL_TYPES = {'End', 'Exception'}
+GENERIC_NAME_RE = re.compile(
+    r'^(Stage|Action|Calc|Calculation|Multiple ?Calculation|Decision|Code|Anchor|Block|Recover|'
+    r'Resume|End|Start|Loop ?Start|Loop ?End|Choice|Choice ?Start|Choice ?End|Wait|Wait ?Start|'
+    r'Wait ?End|Exception|Navigate|Read|Write|Data|Collection|Process ?Info|SubSheet|Page)\d+$', re.I)
+PLUSPLUS_RE = re.compile(r'\+\+\s*$')
+EXPOSED = {'Environment', 'Session', 'Statistic'}
+
+
+def _expr_texts(st):
+    """Every expression-ish string a stage carries (for data-item usage)."""
+    out = []
+    for el in st.iter():
+        for attr in ('expr', 'expression', 'detail'):
+            v = el.get(attr)
+            if v:
+                out.append(v)
+        if el.tag in ('expression', 'timeout', 'loopdata') and el.text:
+            out.append(el.text if el.tag != 'loopdata' else f'[{el.text}]')
+    return out
+
+
+def _targets(st):
+    """Stage ids this stage can flow to."""
+    ids = []
+    for tag in ('onsuccess', 'ontrue', 'onfalse'):
+        for el in st.iter(tag):
+            if el.text:
+                ids.append(el.text.strip())
+    return ids
+
+
+def strict_checks(root, stages):
+    probs = []
+    by_page = {}
+    for st in stages:
+        by_page.setdefault(page_of(st), []).append(st)
+    page_name = {(st.find('subsheetid').text if st.find('subsheetid') is not None else None): st.get('name')
+                 for st in stages if st.get('type') == 'SubSheetInfo'}
+    page_name.setdefault(None, 'Main')
+
+    # 1. duplicate stage names on one page (Notes exempt: estate keeps default Note names)
+    for pg, sts in by_page.items():
+        seen = {}
+        for st in sts:
+            if (st.get('type') in ('Note', 'SubSheetInfo', 'ProcessInfo')
+                    or (st.get('type') == 'End' and st.get('name') == 'End')):
+                continue          # several End stages all named "End" is normal Blue Prism
+            seen.setdefault(st.get('name'), []).append(st.get('type'))
+        dups = {n: t for n, t in seen.items() if len(t) > 1}
+        if dups:
+            probs.append(f"strict: page '{page_name.get(pg, '?')}' duplicate stage names: " +
+                         ', '.join(f'{n!r} x{len(t)}' for n, t in sorted(dups.items())))
+
+    # 2. generic / numbered / ++ names
+    generic = sorted({st.get('name') for st in stages
+                      if st.get('type') not in ('Note',)
+                      and (GENERIC_NAME_RE.match(st.get('name') or '')
+                           or PLUSPLUS_RE.search(st.get('name') or ''))})
+    if generic:
+        probs.append(f'strict: generic/numbered names (anti-pattern): {generic[:10]}')
+
+    # 3. unreachable flow stages + 4. dead ends
+    for pg, sts in by_page.items():
+        flow = {st.get('stageid'): st for st in sts if st.get('type') in FLOW_TYPES}
+        flow_notes = {st.get('stageid'): st for st in sts
+                      if st.get('type') == 'Note' and st.find('onsuccess') is not None}
+        roots = [sid for sid, st in flow.items() if st.get('type') in ('Start', 'Recover')]
+        # ChoiceEnd / WaitEnd / LoopEnd (otherwise / time-out / collection-exhausted path)
+        # are entered implicitly from their Start with the same groupid -- follow that
+        # pairing inside the same walk. Notes can sit in the flow (they carry onsuccess).
+        for sid, st in flow_notes.items():
+            flow.setdefault(sid, st)
+        pair_end = {}
+        for sid, st in flow.items():
+            if st.get('type') in ('ChoiceEnd', 'WaitEnd', 'LoopEnd'):
+                pair_end.setdefault((st.findtext('groupid') or '').strip(), []).append(sid)
+        reach, todo = set(), list(roots)
+        while todo:
+            sid = todo.pop()
+            if sid in reach or sid not in flow:
+                continue
+            reach.add(sid)
+            st = flow[sid]
+            todo.extend(_targets(st))
+            if st.get('type') in ('ChoiceStart', 'WaitStart', 'LoopStart'):
+                todo.extend(pair_end.get((st.findtext('groupid') or '').strip(), []))
+        unreachable = [st.get('name') for sid, st in flow.items()
+                       if sid not in reach and st.get('type') != 'Note']
+        if unreachable:
+            probs.append(f"strict: page '{page_name.get(pg, '?')}' unreachable stages: {unreachable[:8]}")
+        dead = []
+        for sid, st in flow.items():
+            t = st.get('type')
+            if t in TERMINAL_TYPES or t == 'Note':
+                continue
+            if t == 'Decision':
+                if st.find('ontrue') is None or st.find('onfalse') is None:
+                    dead.append(st.get('name'))
+            elif t in ('ChoiceStart', 'WaitStart'):
+                continue            # exits are per-choice ontrue + the matching End's onsuccess
+            elif not _targets(st):
+                dead.append(st.get('name'))
+        if dead:
+            probs.append(f"strict: page '{page_name.get(pg, '?')}' dead ends (no exit): {dead[:8]}")
+
+    # 5. unused data items (referenced nowhere in the file)
+    used = set()
+    for st in stages:
+        for e in _expr_texts(st):
+            for ref in REF_RE.findall(QUOTED_RE.sub('', e)):
+                used.add(ref.split('.')[0].strip())
+        for el in st.iter():
+            v = el.get('stage')
+            if v:
+                used.add(v)
+    unused = []
+    for st in stages:
+        if st.get('type') not in ('Data', 'Collection'):
+            continue
+        if (st.findtext('exposure') or '').strip() in EXPOSED:
+            continue
+        if st.get('name') not in used:
+            unused.append(st.get('name'))
+    if unused:
+        probs.append(f'strict: {len(unused)} unused data item(s): {sorted(unused)[:10]}')
+
+    # 6. flags/numbers without an explicit initial value
+    no_init = [st.get('name') for st in stages if st.get('type') == 'Data'
+               and (st.findtext('datatype') or '') in ('flag', 'number')
+               and not (st.findtext('initialvalue') or '').strip()
+               and (st.findtext('exposure') or '').strip() not in EXPOSED]
+    if no_init:
+        probs.append(f'strict: flag/number item(s) without explicit initial value: {sorted(no_init)[:10]}')
+
+    # 7. leftover debug breakpoints
+    bps = [st.get('name') for st in stages if st.find('breakpoint') is not None]
+    if bps:
+        probs.append(f'strict: debug breakpoint(s) left in: {bps[:8]}')
+
+    # 8. Choice / Wait pairing
+    for a, b in (('ChoiceStart', 'ChoiceEnd'), ('WaitStart', 'WaitEnd')):
+        sa = [(st.findtext('groupid') or '') for st in stages if st.get('type') == a]
+        sb = [(st.findtext('groupid') or '') for st in stages if st.get('type') == b]
+        for g in set(sa) | set(sb):
+            if sa.count(g) != 1 or sb.count(g) != 1:
+                probs.append(f'strict: {a}/{b} groupid {g[:8]}.. does not pair 1:1')
+
+    # 9. Exception stage with empty type (not a rethrow)
+    empty_ex = [st.get('name') for st in stages if st.get('type') == 'Exception'
+                and st.find('exception') is not None
+                and st.find('exception').get('usecurrent') != 'yes'
+                and not (st.find('exception').get('type') or '').strip()]
+    if empty_ex:
+        probs.append(f'strict: Exception stage(s) with empty type: {empty_ex}')
+
+    # 10. expression hygiene: flag compared to True/False, AND+OR without parentheses
+    for st in stages:
+        for e in _expr_texts(st):
+            bare = QUOTED_RE.sub('""', e)
+            if re.search(r'\]\s*=\s*(True|False)\b', bare, re.I):
+                probs.append(f"strict: '{st.get('name')}' compares a flag to True/False ({e[:50]}); "
+                             f"use the flag directly / Not(...)")
+            if re.search(r'\bAND\b', bare, re.I) and re.search(r'\bOR\b', bare, re.I) and '(' not in bare:
+                probs.append(f"strict: '{st.get('name')}' mixes AND/OR without parentheses ({e[:50]})")
+    return probs
+
+
+def validate_dir(base, show_flow=False, estate=False, strict=False):
+    files = sorted(glob.glob(os.path.join(base, '*.xml')))
+    if not files:
+        print(f'(no .xml files in {base})')
+        return False
+
+    all_ok = True
+    roots = {}
+    for fp in files:
+        name = os.path.basename(fp)
+        try:
+            roots[name] = load(fp)
+        except Exception as e:
+            print(f'[FAIL] {name}: XML error {e}')
+            all_ok = False
+    catalogue = object_catalogue(roots)
+
+    for name, root in roots.items():
+        problems, warnings = [], []
+        stages = list(root.iter('stage'))
+
+        if root.tag != 'process':
+            problems.append(f'root is <{root.tag}> not <process>')
+
+        pname = root.get('name') or ''
+        for pre in ('BPA Object - ', 'BPA Process - '):
+            if pname.startswith(pre):
+                problems.append(f"internal name carries filename prefix '{pre}' "
+                                f"(breaks cross-object resolution)")
+
+        for child in root:
+            if child.tag in ('globalcode', 'code', 'references', 'imports', 'language'):
+                problems.append(f'<{child.tag}> is a direct child of <process>; it must live '
+                                f'inside the Code Options ProcessInfo stage (object will not compile)')
+        if list(root.iter('namespaces')):
+            problems.append('<namespaces> found: the tag must be <imports>')
+
+        stage_ids, dup_ids = set(), set()
+        for st in stages:
+            sid = st.get('stageid')
+            if sid:
+                if sid in stage_ids:
+                    dup_ids.add(sid)
+                stage_ids.add(sid)
+        if dup_ids:
+            problems.append(f'{len(dup_ids)} duplicate stageid(s)')
+
+        decl_ids = set()
+        for ss in root.iter('subsheet'):
+            i = ss.get('subsheetid')
+            if i:
+                decl_ids.add(i)
+        page_ids = set()
+        for st in stages:
+            if st.get('type') == 'SubSheetInfo':
+                si = st.find('subsheetid')
+                if si is not None and si.text:
+                    page_ids.add(si.text)
+
+        broken = []
+        for st in stages:
+            for tag in ('onsuccess', 'ontrue', 'onfalse'):
+                el = st.find(tag)
+                if el is not None and el.text and el.text not in stage_ids:
+                    broken.append((st.get('name'), tag, el.text))
+
+        # invalid input expressions: an unquoted text/password literal imports as
+        # "Invalid expression for input parameter". Use lit() in the generator.
+        bad_exprs = []
+        for st in stages:
+            for inp in st.iter('input'):
+                if inp.get('type') in ('text', 'password') and bad_literal(inp.get('expr')):
+                    bad_exprs.append((st.get('name'), inp.get('name'), inp.get('expr')))
+
+        if broken:
+            problems.append(f'{len(broken)} broken flow refs')
+        if bad_exprs:
+            problems.append(f'{len(bad_exprs)} invalid literal expr(s)')
+        missing_info = decl_ids - page_ids
+        missing_decl = page_ids - decl_ids
+        if missing_info:
+            problems.append(f'{len(missing_info)} subsheet decls without SubSheetInfo')
+        if missing_decl:
+            problems.append(f'{len(missing_decl)} SubSheetInfo without decl')
+
+        # --- per-page data items ------------------------------------------
+        data_by_page = {}
+        types_by_page = {}
+        for st in stages:
+            if st.get('type') in ('Data', 'Collection'):
+                pg = page_of(st)
+                data_by_page.setdefault(pg, set()).add(st.get('name'))
+                types_by_page.setdefault(pg, {})[st.get('name')] = st.get('type')
+            if st.get('type') == 'Data' and (st.findtext('datatype') or '') == 'collection':
+                problems.append(f"Data stage '{st.get('name')}' has datatype collection: must be "
+                                f"a type=\"Collection\" stage (ForEach/[Coll.Field] break)")
+
+        def visible(pg):
+            # main-page items are visible everywhere unless private; page items locally
+            return data_by_page.get(pg, set()) | data_by_page.get(None, set())
+
+        # outputs must land on an existing data item (gotcha: null-ref, no clue)
+        for st in stages:
+            if st.get('type') in ('Start', 'End'):
+                continue   # Start/End params ARE the data items (checked below)
+            for out in st.iter('output'):
+                tgt = out.get('stage')
+                if tgt and tgt not in visible(page_of(st)):
+                    problems.append(f"stage '{st.get('name')}': output '{out.get('name')}' -> "
+                                    f"'{tgt}' is not a data item on this page")
+        for st in stages:
+            if st.get('type') in ('Start', 'End'):
+                for prm in list(st.iter('input')) + list(st.iter('output')):
+                    tgt = prm.get('stage')
+                    if tgt and tgt not in visible(page_of(st)):
+                        problems.append(f"{st.get('type')} param '{prm.get('name')}' -> '{tgt}' "
+                                        f"has no data item on its page")
+
+        # loops
+        starts, ends = {}, {}
+        for st in stages:
+            t = st.get('type')
+            if t in ('LoopStart', 'LoopEnd'):
+                g = (st.findtext('groupid') or '').strip()
+                (starts if t == 'LoopStart' else ends).setdefault(g, []).append(st.get('name'))
+            if t == 'LoopStart':
+                coll = (st.findtext('loopdata') or '').strip()
+                if (types_by_page.get(page_of(st), {}).get(coll) != 'Collection'
+                        and types_by_page.get(None, {}).get(coll) != 'Collection'):
+                    problems.append(f"loop '{st.get('name')}': loopdata '{coll}' is not a "
+                                    f"Collection stage on this page")
+        for g in set(starts) | set(ends):
+            if len(starts.get(g, [])) != 1 or len(ends.get(g, [])) != 1:
+                problems.append(f'LoopStart/LoopEnd groupid {g[:8]}.. does not pair 1:1 '
+                                f'(starts={starts.get(g, [])}, ends={ends.get(g, [])})')
+
+        # [Item] references (warn: env vars / session vars are legit unknowns)
+        unresolved = set()
+        for st in stages:
+            exprs = []
+            for inp in st.iter('input'):
+                exprs.append(inp.get('expr') or '')
+            d = st.find('decision')
+            if d is not None:
+                exprs.append(d.get('expression') or '')
+            for c in st.iter('calculation'):
+                exprs.append(c.get('expression') or '')
+            ex = st.find('exception')
+            if ex is not None:
+                exprs.append(ex.get('detail') or '')
+            for e in exprs:
+                for ref in REF_RE.findall(QUOTED_RE.sub('', e)):
+                    base_name = ref.split('.')[0]
+                    if base_name not in visible(page_of(st)):
+                        unresolved.add((st.get('name'), base_name))
+        if unresolved:
+            warnings.append(f'{len(unresolved)} [ref](s) with no data item on the page: ' +
+                            ', '.join(sorted(f'{s}->[{r}]' for s, r in unresolved)[:6]))
+
+        # cross-object calls into objects present in this directory
+        unchecked = set()
+        for st in stages:
+            if st.get('type') != 'Action':
+                continue
+            res = st.find('resource')
+            if res is None:
+                continue
+            obj, act = res.get('object'), res.get('action')
+            if obj not in catalogue:
+                unchecked.add(obj)
+                continue
+            pages = catalogue[obj]
+            if act not in pages:
+                problems.append(f"stage '{st.get('name')}': object '{obj}' has no action "
+                                f"'{act}' (exact match). Has: {sorted(pages)[:8]}")
+                continue
+            published, ins = pages[act]
+            if not published:
+                problems.append(f"stage '{st.get('name')}': '{obj}'.'{act}' is not published")
+            for inp in st.iter('input'):
+                if inp.get('name') not in ins:
+                    problems.append(f"stage '{st.get('name')}': input '{inp.get('name')}' is not a "
+                                    f"Start input of '{obj}'.'{act}' (has {ins})")
+
+        # Python-format slots fed to C# string.Format -> FormatException at runtime
+        fmt_bad = []
+        for st in stages:
+            if st.get('type') not in ('Code', 'ProcessInfo'):
+                continue
+            body = st.findtext('code') or ''
+            for m in re.finditer(r'(?:string|String)\.Format\s*\(([^;]*)', body):
+                if '{}' in m.group(1):
+                    fmt_bad.append(st.get('name'))
+        if fmt_bad:
+            problems.append(f"string.Format with a Python-style '{{}}' slot in: {sorted(set(fmt_bad))} "
+                            f"(throws FormatException; use .Replace(\"{{}}\", ...))")
+
+        # non-ASCII
+        nonascii = [st.get('name') for st in stages
+                    if any(ord(c) > 126 for c in (st.get('name') or '') + (st.findtext('narrative') or ''))]
+        if nonascii:
+            warnings.append(f'non-ASCII in {len(nonascii)} stage name/narrative(s): {nonascii[:4]}')
+
+        if estate:
+            subsheets = list(root.iter('subsheet'))
+            artifact_type = root.get('type')
+            if artifact_type == 'object':
+                if not subsheets:
+                    problems.append('estate: object has no action pages')
+                else:
+                    first = subsheets[0]
+                    first_name = (first.findtext('name') or '').strip()
+                    if first_name != 'Clean Up' or first.get('type') != 'CleanUp':
+                        problems.append('estate: first object page must be Clean Up/CleanUp')
+                    unpublished_cleanup = [ss for ss in subsheets
+                                           if (ss.findtext('name') or '').strip() == 'Clean Up'
+                                           and (ss.get('published') or '').lower() != 'true']
+                    if unpublished_cleanup:
+                        problems.append('estate: Clean Up page must be published')
+            elif artifact_type == 'process':
+                published_pages = [(ss.findtext('name') or '').strip() for ss in subsheets
+                                   if (ss.get('published') or '').lower() == 'true']
+                if published_pages:
+                    problems.append('estate: process subsheets must be unpublished: ' +
+                                    ', '.join(published_pages))
+
+            bad_decisions = [st.get('name') for st in stages
+                             if st.get('type') == 'Decision'
+                             and not (st.get('name') or '').rstrip().endswith('?')]
+            if bad_decisions:
+                problems.append(f"estate: {len(bad_decisions)} Decision name(s) lack '?': " +
+                                ', '.join(bad_decisions[:5]))
+
+            bad_exception_types = []
+            for st in stages:
+                if st.get('type') != 'Exception':
+                    continue
+                ex = st.find('exception')
+                if ex is None or ex.get('usecurrent') == 'yes':
+                    continue
+                ex_type = (ex.get('type') or '').strip()
+                if ex_type not in ('System Exception', 'Business Exception', 'Runtime Exception'):
+                    bad_exception_types.append((st.get('name'), ex_type))
+            if bad_exception_types:
+                problems.append(f'estate: {len(bad_exception_types)} invalid exception type(s): ' +
+                                ', '.join(f'{n}={t!r}' for n, t in bad_exception_types[:5]))
+
+            for info in [st for st in stages if st.get('type') == 'ProcessInfo']:
+                if (info.findtext('globalcode') or '').strip():
+                    problems.append('estate: <globalcode> must be empty')
+                code = info.findtext('code') or ''
+                if code.strip() and info.findtext('language') != 'csharp':
+                    problems.append('estate: new shared code must use csharp')
+
+            waits = [st for st in stages if st.get('type') == 'WaitStart']
+            wait_ends = [st for st in stages if st.get('type') == 'WaitEnd']
+            if len(waits) != len(wait_ends):
+                problems.append(f'estate: WaitStart/WaitEnd mismatch ({len(waits)}/{len(wait_ends)})')
+
+        # Reachability: a non-main page is invoked by a SubSheet (page-call) stage
+        # whose <processid> equals that page's subsheetid. A process page that is
+        # never referenced is ORPHANED -- flag it instead of passing it as ALL
+        # CLEAN. (Objects are called externally by action name, so this
+        # reachability rule only applies to type="process".)
+        is_process = root.get('type') == 'process'
+        called_ssids = set()
+        for st in stages:
+            pidel = st.find('processid')
+            if pidel is not None and pidel.text:
+                called_ssids.add(pidel.text)
+        orphan_pages = []
+        for st in stages:
+            if st.get('type') == 'SubSheetInfo':
+                si = st.find('subsheetid')
+                if si is not None and si.text and si.text not in called_ssids:
+                    orphan_pages.append(st.get('name'))
+        if orphan_pages and is_process:
+            problems.append(f'{len(orphan_pages)} unreachable page(s) '
+                            f'(not called by any page-ref): ' + ', '.join(orphan_pages))
+
+        # Same-name collisions: a page name that equals an action/decision name
+        # is misleading in the --flow report (looks like a page call, is an
+        # object call).
+        page_names = {st.get('name') for st in stages if st.get('type') == 'SubSheetInfo'}
+        step_names = {st.get('name') for st in stages
+                      if st.get('type') in ('Action', 'Decision', 'Code')}
+        collisions = page_names & step_names
+        if collisions and root.get('type') == 'process':
+            problems.append(f'{len(collisions)} page/stage name collision(s): ' +
+                            ', '.join(sorted(collisions)))
+
+
+        if strict:
+            problems.extend(strict_checks(root, stages))
+
+        status = 'OK  ' if not problems else 'FAIL'
+        if problems:
+            all_ok = False
+        print(f'[{status}] {name}: stages={len(stage_ids)} pages={len(page_ids)} '
+              f'decls={len(decl_ids)}' + ((' -> ' + '; '.join(problems)) if problems else ''))
+        for w in warnings:
+            print(f'       WARN {w}')
+        for b in broken[:5]:
+            print(f'       broken: {b}')
+        for e in bad_exprs[:5]:
+            print(f'       bad expr: stage={e[0]!r} input={e[1]!r} expr={e[2]!r} '
+                  f'(unquoted text literal -- wrap with lit())')
+
+        # Flow-target report: resolve every link to the TARGET stage's name so
+        # you can actually eyeball where decisions/gotos/loops go. A link that
+        # points at an End stage is flagged (*) because that is where a mistyped
+        # goto/decision target silently falls back to -- the usual hidden bug.
+        if show_flow:
+            if unchecked:
+                print(f'       external objects (not in dir, unchecked): {sorted(unchecked)}')
+            id2name, id2type, id2stage = {}, {}, {}
+            for st in stages:
+                sid = st.get('stageid')
+                if sid:
+                    id2name[sid] = st.get('name')
+                    id2type[sid] = st.get('type')
+                    id2stage[sid] = st
+            for st in stages:
+                stype = st.get('type')
+                if stype not in ('Decision', 'Action', 'Code', 'LoopStart', 'LoopEnd', 'Start',
+                                 'SubSheet', 'Calculation', 'MultipleCalculation',
+                                 'ChoiceStart', 'ChoiceEnd', 'Resume', 'Recover'):
+                    continue
+                for tag, el in [(t, e) for t in ('onsuccess', 'ontrue', 'onfalse') for e in st.iter(t)]:
+                    if el is None or not el.text:
+                        continue
+                    # follow routing anchors to the real target
+                    cur, hops = el.text, 0
+                    while id2type.get(cur) == 'Anchor' and hops < 50:
+                        nxt_el = id2stage[cur].find('onsuccess')
+                        if nxt_el is None or not nxt_el.text:
+                            break
+                        cur, hops = nxt_el.text, hops + 1
+                    tgt = id2name.get(cur, '??')
+                    via = f' (via {hops} anchors)' if hops else ''
+                    flag = ' *(End)' if id2type.get(cur) == 'End' else ''
+                    print(f'         {st.get("name")!r:32} --{tag}--> {tgt!r}{flag}{via}')
+            print()
+    print('ALL CLEAN' if all_ok else 'PROBLEMS FOUND')
+    return all_ok
+
+
+if __name__ == '__main__':
+    args = [a for a in sys.argv[1:] if not a.startswith('-')]
+    flags = [a for a in sys.argv[1:] if a.startswith('-')]
+    ok = validate_dir(args[0] if args else 'out',
+                      show_flow=('--flow' in flags or '-f' in flags),
+                      estate='--estate' in flags,
+                      strict='--strict' in flags)
+    sys.exit(0 if ok else 1)
