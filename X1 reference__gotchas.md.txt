@@ -1,0 +1,110 @@
+# Gotchas (hard-won)
+
+Things that will silently break a Blue Prism import or an XML build if ignored.
+
+## Encoding & line endings
+- **Write UTF-8 with `newline='\n'`.** `bp_gen.Proc.write()` already does this. Do NOT
+  round-trip generated files through PowerShell `Set-Content` / `Out-File` -- they re-encode
+  (BOM/UTF-16) and rewrite line endings, which corrupts CDATA code bodies and produces
+  mojibake on import.
+- **Keep narrative text ASCII-safe.** No smart quotes, em-dashes or arrows (use `->` not an
+  arrow glyph). Non-ASCII in attributes is the usual cause of garbled labels after import.
+  The generator now refuses non-ASCII names/narratives outright.
+
+## Reading generated files from the shell
+- If the workspace root does not contain the output folder, the editor's file-read tool may
+  refuse it. Use `Get-Content -LiteralPath '...'` in the terminal instead. Paths with spaces
+  need `-LiteralPath` and quotes.
+- **PowerShell's XML adapter has a footgun:** `$node.<childtag>` returns the `name`
+  attribute value if a child has a `name` attribute, instead of the child element. Use
+  `GetElementsByTagName()` and check `LocalName` when walking BP XML.
+
+## Running Python via conda run
+- `conda run ... python -c "<code>"` **fails if the `-c` code contains a newline** (conda
+  asserts against it). Put multi-line checks in a `.py` file and run that file, or keep `-c`
+  to a single line.
+- Full invocation used in this project:
+  `C:/Users/.../conda.exe run -p C:\Users\...\envname --no-capture-output python script.py`
+
+## Code stages
+- **Code Options belong in the ProcessInfo stage.** Put `<language>`, `<references>`,
+  `<imports>`, `<globalcode>`, and the shared `<code>` body in the proven
+  Code Options/ProcessInfo stage shape. Do not move these elements to the root `<process>`
+  node; Blue Prism may import the XML but fail compilation and surface only a null-reference
+  at the calling Action stage. (`validate.py` now fails on this.)
+- **Keep root/shared `<globalcode>` empty for this estate.** If a proven project requires
+  shared C# (for example GK Revoke), store the class/helper body in the ProcessInfo stage's
+  `<code>` element, matching the source XML exactly.
+- **Use `<imports>`, not `<namespaces>`.** The wrong element name can produce the same
+  opaque compile/null-reference failure. (`validate.py` now fails on this.)
+- Code bodies are passed through **verbatim** inside CDATA. The generator escapes a stray
+  `]]>` but does not touch your C#. If a `<` or `&` appears in code that is fine inside
+  CDATA -- do NOT HTML-escape code.
+- **Any compile failure = null-ref at runtime, at the Action call, with no clue as to why.**
+  Missing input mapping, output mapping to a stage that doesn't exist, unbalanced braces in a
+  code stage -- all present the same way. If a stage null-refs, first suspect a compile
+  problem in the object it calls, not a data problem. **Run `lib/compile_check.py` before
+  every import** -- it turns this class of bug into a compiler error with stage name and
+  line. `validate.py` catches the missing-output-item and cross-object mapping cases.
+- **How Blue Prism wraps code (what compile_check reproduces, calibrated on the official
+  MS Excel / Collection / Environment / File Management VBOs, 118 VB stages):** each code
+  stage is a method NAMED AFTER THE STAGE (spaces -> underscores), so shared code can call a
+  stage (`Create_Instance(Handle)`); outputs are ByRef; names that are keywords (`Set`) are
+  escaped; duplicate imports are tolerated; reference file names are case-insensitive.
+- **The Windows built-in `csc.exe` (Framework v4.0.30319) only knows C# 5.** If the Phase-0
+  compiler probe showed Blue Prism accepts newer syntax (`$"..."`, `?.`, `nameof`), the gate
+  will report those lines as errors -- either avoid the newer syntax (safest: then both
+  compilers agree) or point `--csc` at a newer compiler.
+- **Python `.format` slots are not C# format slots.** `"...[{}]...".format(i)` ported as
+  `string.Format("...[{}]...", i)` throws `FormatException` at runtime -- and it compiles
+  fine, so the gate cannot catch it. Use `.Replace("{}", i.ToString())`. Grep ported code
+  for `"{}"` and `[{}]`.
+
+## Machine prerequisites (runtime, not build)
+When the object actually runs on a Blue Prism machine you typically need:
+- The browser driver (e.g. `msedgedriver.exe`) at the configured path, **major version
+  matching the installed Edge** (Edge auto-updates, the driver does not).
+- For estate projects that DO use Selenium (not GK Revoke, which forbids it): `WebDriver.dll`
+  and `WebDriver.Support.dll` referenced and deployed.
+- Excel via OLEDB: the ACE OLEDB provider installed (the classic "missing provider / could
+  not find installable ISAM" error otherwise). ACE `UPDATE` may silently no-op on `.xlsx` --
+  see the project's Dev Prompt.
+- Any other third-party DLL your code references must be deployed to the BP install, not
+  just present at design time.
+
+## Flow-link mistakes the validator catches
+- A `goto`/decision target name that does not match any stage name -- the generator now
+  **raises** instead of falling back to End. Hand-edited XML can still have links to End by
+  mistake: run `validate.py --flow` and eyeball every `*(End)`.
+- A `LoopEnd` whose `groupid` does not match its `LoopStart` will not pair. Always create
+  loops via `loop_start()`/`loop_end()` so the ids stay matched (validator checks 1:1 pairing).
+
+## Collections are their own stage type
+A collection must be a `type="Collection"` stage, NOT a `type="Data"` stage with
+`<datatype>collection</datatype>`. The latter can import as a degraded/untyped item and
+break ForEach `<loopdata>` and `[Collection.Field]` references. The generator does this for
+you (any `'collection'`-typed data item renders as a Collection stage) -- but if you
+hand-write or post-process XML, preserve the distinction. Quick check: a ForEach's
+`<loopdata>` name should resolve to a `type="Collection"` stage (validator checks this).
+
+## Determinism
+- Stage ids are `uuid5` of (object, page, kind, name, index). Renaming a stage or reordering
+  steps changes ids -- expected. Keep names stable across rebuilds so Blue Prism treats
+  re-imports as updates.
+
+## Learned from the first run on real estate files
+- **`published="True"` (capital T).** Real exports write the flag capitalised; a
+  case-sensitive check reports every action as unpublished. Compare case-insensitively.
+- **Exports carry a default namespace** (`xmlns="http://www.blueprism.co.uk/product/process"`).
+  A parser that searches for plain `stage` then finds NOTHING and reports the file as clean.
+  Strip the namespace first (validate.py, compile_check.py and preview.py all do).
+- **Code environment at the `<process>` root fails silently.** Two working-looking objects
+  (an email and a Word VBO) had `<references>`/`<language>`/`<namespaces>` directly under
+  `<process>`: they import, show their code, and never compile. Nothing called them, so
+  nobody noticed. `validate.py` and `compile_check.py` both FAIL this shape now.
+- **Code stages with the same name AND the same inputs collide.** Each code stage becomes a
+  method named after the stage; two stages named `Code` with identical parameters give
+  "has multiple definitions with identical signatures". Name code stages after what they do.
+- **The Framework `csc.exe` is C# 5.** Blue Prism 7 compiles with its own Roslyn
+  (`<Blue Prism install>\roslyn\`). Always pass `--ref-dir "<Blue Prism install>"` so the gate
+  uses the same compiler; otherwise modern syntax (local functions etc.) shows as false errors.
