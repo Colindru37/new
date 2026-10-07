@@ -1,0 +1,434 @@
+"""
+compile_check.py -- compile every C# / VB.NET code stage BEFORE importing into Blue Prism.
+
+Why: a code stage that does not compile does not fail at import. Blue Prism
+imports the object, and at runtime every Action into it throws
+"Object reference not set to an instance of an object" with no other clue.
+This script turns that into a normal compiler error with the stage name and line.
+
+How it works: for each *.xml in the directory that has a Code Options
+(ProcessInfo) stage, it rebuilds what Blue Prism builds internally --
+  * one class holding the shared <code> (fields, helper methods, nested classes)
+  * one method per Code stage, NAMED AFTER THE STAGE (spaces -> underscores):
+    shared code may call a stage as a method -- the official MS Excel VBO calls
+    Create_Instance(Handle). Inputs become parameters, outputs ByRef/out params.
+  * imports de-duplicated (Blue Prism tolerates duplicates), reference names
+    matched case-insensitively (Windows does).
+Calibrated against the official Blue Prism VBOs (MS Excel VBO, Utility - Collection
+Manipulation / Environment / File Management): all compile clean.
+  * the object's <imports> as `using` lines, its <references> as compiler refs
+-- and compiles it as a library. `#line` directives map every error back to
+"<object>/<page>/<stage>(line,col)".
+
+Language follows the object's <language> (estate: 5/8 objects VB, 3/8 C#).
+Compiler, first found wins (C#: csc.exe, VB: vbc.exe):
+  1. --csc / --vbc <path>                         explicit
+  2. under any --ref-dir (a 'roslyn' folder wins) Blue Prism's OWN compiler -- use this:
+     pass --ref-dir "<Blue Prism install folder>" and the gate compiles exactly what BP does
+  3. %WINDIR%\\Microsoft.NET\\Framework64\\v4.0.30319\\  (every Windows box; csc = C# 5 ONLY,
+     so newer syntax -- local functions, out var, $"", ?. -- shows as false errors)
+  4. mcs / csc / vbc on PATH (Linux/mono for development)
+The chosen compiler is printed, with a warning when it is the C# 5 one. VB compiles with
+Option Explicit On / Option Strict Off unless --option-strict is passed. On mono, VB needs
+--vbruntime (or BP_VBRUNTIME) pointing at a Microsoft.VisualBasic.dll reference assembly.
+
+References not found in the framework are searched in each --ref-dir (e.g. the
+Blue Prism install dir, for Newtonsoft.Json.dll).
+
+Run:   python compile_check.py [directory] --ref-dir "<Blue Prism folder>" [--ref-dir DIR]...
+                               [--csc PATH] [--vbc PATH] [--vbruntime DLL] [--option-strict] [--keep]
+       python compile_check.py --self-test --ref-dir "<Blue Prism folder>"   (must print PASS)
+Exit code 0 = every C# object compiled, 1 = at least one failed or was unchecked.
+"""
+import os, sys, re, glob, shutil, subprocess, tempfile
+import xml.etree.ElementTree as ET
+
+TYPE_MAP = {
+    'text': 'string', 'number': 'decimal', 'flag': 'bool',
+    'date': 'DateTime', 'datetime': 'DateTime', 'time': 'DateTime',
+    'timespan': 'TimeSpan', 'password': 'System.Security.SecureString',
+    'collection': 'System.Data.DataTable', 'binary': 'byte[]',
+    'image': 'System.Drawing.Bitmap',
+}
+FRAMEWORK_REFS = {
+    'System.dll', 'System.Data.dll', 'System.Xml.dll', 'System.Drawing.dll',
+    'System.Core.dll', 'System.Web.dll', 'System.Web.Extensions.dll',
+    'System.Net.Http.dll', 'System.Xml.Linq.dll', 'System.Data.DataSetExtensions.dll',
+    'Microsoft.CSharp.dll', 'mscorlib.dll', 'System.Windows.Forms.dll',
+    'System.IO.Compression.dll', 'System.IO.Compression.FileSystem.dll',
+    'System.Security.dll', 'System.Management.dll', 'System.DirectoryServices.dll',
+    'System.Configuration.dll', 'System.Runtime.Serialization.dll',
+    'Microsoft.VisualBasic.dll',
+}
+VB_TYPE_MAP = {
+    'text': 'String', 'number': 'Decimal', 'flag': 'Boolean',
+    'date': 'Date', 'datetime': 'Date', 'time': 'Date',
+    'timespan': 'TimeSpan', 'password': 'System.Security.SecureString',
+    'collection': 'System.Data.DataTable', 'binary': 'Byte()',
+    'image': 'System.Drawing.Bitmap',
+}
+VB_LANGS = {'visualbasic', 'vb', 'vb.net', 'vbnet'}
+VB_ERR_RE = re.compile(r'^(?P<file>.+?)\((?P<line>\d+)\)\s*:\s*(?P<sev>error|warning)\s+(?P<code>BC\d+):\s*(?P<msg>.*)$')
+ERR_RE = re.compile(r'^(?P<file>.+?)\((?P<line>\d+),(?P<col>\d+)\):\s*(?P<sev>error|warning)\s+(?P<code>CS\d+):\s*(?P<msg>.*)$')
+
+
+def ident(name):
+    s = re.sub(r'[^A-Za-z0-9_]', '_', name.strip().replace(' ', '_'))
+    return ('_' + s) if (not s or s[0].isdigit()) else s
+
+
+def find_in_dirs(dirs, exe):
+    """Look for exe (e.g. csc.exe) under the given folders, a few levels deep. A copy inside
+    a folder named 'roslyn' wins: that is the compiler Blue Prism itself ships and uses."""
+    hits = []
+    for base in dirs or ():
+        if not base or not os.path.isdir(base):
+            continue
+        root_depth = base.rstrip('\\/').count(os.sep)
+        for dp, dns, fns in os.walk(base):
+            if dp.count(os.sep) - root_depth >= 4:
+                dns[:] = []
+            for fn in fns:
+                if fn.lower() == exe:
+                    hits.append(os.path.join(dp, fn))
+    hits.sort(key=lambda h: (0 if 'roslyn' in h.lower() else 1, len(h)))
+    return hits[0] if hits else None
+
+
+def _framework_exe(exe):
+    windir = os.environ.get('WINDIR') or os.environ.get('SystemRoot')
+    if windir:
+        for fw in ('Framework64', 'Framework'):
+            p = os.path.join(windir, 'Microsoft.NET', fw, 'v4.0.30319', exe)
+            if os.path.exists(p):
+                return p
+    return None
+
+
+def find_compiler(explicit=None, ref_dirs=()):
+    """C#: explicit -> Blue Prism's own (Roslyn, found under --ref-dir) -> Framework csc.exe
+    (C# 5 only) -> mcs/csc on PATH."""
+    if explicit:
+        return explicit
+    return (find_in_dirs(ref_dirs, 'csc.exe') or _framework_exe('csc.exe')
+            or shutil.which('mcs') or shutil.which('csc'))
+
+
+def find_vb_compiler(explicit=None, ref_dirs=()):
+    if explicit:
+        return explicit
+    return find_in_dirs(ref_dirs, 'vbc.exe') or _framework_exe('vbc.exe') or shutil.which('vbc')
+
+
+def describe_compiler(path, ref_dirs=()):
+    if not path:
+        return 'NONE'
+    low = path.lower().replace('\\', '/')
+    if any(d and low.startswith(d.lower().replace('\\', '/')) for d in ref_dirs or ()):
+        return f'{path}  (Blue Prism\'s own compiler)'
+    if 'microsoft.net/framework' in low and low.endswith('csc.exe'):
+        return (f'{path}  (WARNING: Framework csc = C# 5 only; newer syntax in your code shows as '
+                f'false errors. Pass --ref-dir "<Blue Prism folder>" to use Blue Prism\'s compiler)')
+    return path
+
+
+def map_label(reported, labels):
+    """Compilers rewrite #line / ExternalSource names (Windows csc: backslashes, temp folder
+    prefix, lowercased folders). Map the reported name back to the exact stage label."""
+    norm = reported.replace('\\', '/').lower()
+    for lab in sorted(labels, key=len, reverse=True):
+        if norm.endswith(lab.replace('\\', '/').lower()):
+            return lab
+    return reported
+
+
+def page_names(root):
+    names = {}
+    for st in root.iter('stage'):
+        if st.get('type') == 'SubSheetInfo':
+            ss = st.find('subsheetid')
+            if ss is not None and ss.text:
+                names[ss.text] = st.get('name')
+    return names
+
+
+def _stage_params(st, vb):
+    """Return (params, default-assignments) the way BP wraps a code stage."""
+    tmap = VB_TYPE_MAP if vb else TYPE_MAP
+    params, defaults, seen = [], [], set()
+    for inp in st.iter('input'):
+        nm = ident(inp.get('name') or '')
+        if nm in seen:
+            continue
+        seen.add(nm)
+        t = tmap.get(inp.get('type'), 'Object' if vb else 'object')
+        params.append(f'ByVal [{nm}] As {t}' if vb else f'{t} @{nm}')
+    for o in st.iter('output'):
+        nm = ident(o.get('name') or '')
+        if nm in seen:
+            continue
+        seen.add(nm)
+        t = tmap.get(o.get('type'), 'Object' if vb else 'object')
+        params.append(f'ByRef [{nm}] As {t}' if vb else f'out {t} @{nm}')
+        defaults.append(f'[{nm}] = Nothing' if vb else f'@{nm} = default({t});')
+    return params, defaults
+
+
+def build_source(root, label):
+    """Return (source, language, code-stage count) for one <process> root.
+    language is 'csharp' or 'vb' (None when the object has no Code Options)."""
+    info = next((st for st in root.iter('stage') if st.get('type') == 'ProcessInfo'), None)
+    if info is None:
+        return None, None, 0, []
+    raw_lang = (info.findtext('language') or '').strip().lower()
+    vb = raw_lang in VB_LANGS
+    lang = 'vb' if vb else raw_lang
+    imports = []
+    for i in info.iter('import'):          # Blue Prism tolerates duplicates; the compiler does not
+        ns = (i.text or '').strip()
+        if ns and ns.lower() not in [x.lower() for x in imports]:
+            imports.append(ns)
+    shared = info.findtext('code') or ''
+    pages = page_names(root)
+    cls = f'BPCheck_{ident(label)}'
+    labels = [f'{label}/Code Options (shared code)']
+
+    if vb:
+        out = [f'Imports {ns}' for ns in imports] + [f'Public Class {cls}']
+        if shared.strip():
+            out += [f'#ExternalSource("{label}/Code Options (shared code)", 1)', shared,
+                    '#End ExternalSource']
+    else:
+        out = [f'using {ns};' for ns in imports] + [f'public class {cls} {{']
+        if shared.strip():
+            out += [f'#line 1 "{label}/Code Options (shared code)"', shared, '#line default']
+    n = 0
+    for st in root.iter('stage'):
+        if st.get('type') != 'Code':
+            continue
+        n += 1
+        ss = st.find('subsheetid')
+        page = pages.get(ss.text, '?') if ss is not None and ss.text else 'Main'
+        params, defaults = _stage_params(st, vb)
+        body = st.findtext('code') or ''
+        stage_label = f'{label}/{page}/{st.get("name")}'.replace('"', "'")
+        labels.append(stage_label)
+        meth = ident(st.get('name') or f'Stage_{n}')
+        if vb:
+            # [..] / @.. escape any identifier, so a stage or input named like a keyword
+            # ("Set", "Error", "string") compiles -- as it does in Blue Prism.
+            out += [f'  Public Sub [{meth}]({", ".join(params)})'] + [f'    {d}' for d in defaults]
+            out += [f'#ExternalSource("{stage_label}", 1)', body, '#End ExternalSource', '  End Sub']
+        else:
+            out += [f'  public void @{meth}({", ".join(params)}) {{', '    ' + ' '.join(defaults),
+                    f'#line 1 "{stage_label}"', body, '#line default', '  }']
+    out.append('End Class' if vb else '}')
+    return '\n'.join(out), lang, n, labels
+
+
+def resolve_refs(root, ref_dirs):
+    info = next((st for st in root.iter('stage') if st.get('type') == 'ProcessInfo'), None)
+    refs, missing = [], []
+    for r in (info.iter('reference') if info is not None else []):
+        name = (r.text or '').strip()
+        if not name:
+            continue
+        base = os.path.basename(name)
+        fw = {r.lower(): r for r in FRAMEWORK_REFS}
+        if base.lower() in fw:                 # Windows file names are case-insensitive
+            base = fw[base.lower()]
+        if base == 'Microsoft.VisualBasic.dll':
+            continue          # the VB runtime is supplied by the compiler (/vbruntime)
+        if base in FRAMEWORK_REFS or base.lower().startswith('system.') and not ref_dirs:
+            refs.append(base)
+            continue
+        hit = next((os.path.join(d, base) for d in ref_dirs
+                    if os.path.exists(os.path.join(d, base))), None)
+        if hit:
+            refs.append(hit)
+        elif os.path.exists(name):
+            refs.append(name)
+        elif base.startswith('System.'):
+            refs.append(base)
+        else:
+            missing.append(base)
+    return refs, missing
+
+
+def default_vbruntime():
+    if os.environ.get('BP_VBRUNTIME') and os.path.exists(os.environ['BP_VBRUNTIME']):
+        return os.environ['BP_VBRUNTIME']
+    for d in ('/usr/lib/mono/4.8-api', '/usr/lib/mono/4.7.2-api', '/usr/lib/mono/4.5-api'):
+        p = os.path.join(d, 'Microsoft.VisualBasic.dll')
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def compile_source(compiler, src, refs, workdir, lang, cfg, labels=()):
+    vb = lang == 'vb'
+    srcfile = os.path.join(workdir, 'check.vb' if vb else 'check.cs')
+    with open(srcfile, 'w', encoding='utf-8', newline='\n') as f:
+        f.write(src)
+    dll = os.path.join(workdir, 'check.dll')
+    sep = '/' if os.name == 'nt' else '-'
+    args = [compiler, f'{sep}nologo', f'{sep}target:library', f'{sep}out:{dll}']
+    if vb:
+        args += [f'{sep}optionexplicit+', f'{sep}optionstrict' + ('+' if cfg.get('option_strict') else '-')]
+        if os.name != 'nt':                              # mono/Roslyn vbc on Linux
+            vbrt = cfg.get('vbruntime') or default_vbruntime()
+            if vbrt:
+                args.append(f'-vbruntime:{vbrt}')
+            if os.path.isdir('/usr/lib/mono/4.8-api'):
+                args.append('-sdkpath:/usr/lib/mono/4.8-api')
+    else:
+        args.append(f'{sep}warn:0')
+        if os.path.basename(compiler).startswith('mcs'):
+            args = [compiler, '-target:library', f'-out:{dll}', '-warn:0', '-sdk:4.5']
+        if cfg.get('langversion'):
+            args.append(f'{sep}langversion:{cfg["langversion"]}')
+    for r in refs:
+        args.append(f'{sep}r:{r}')
+    args.append(srcfile)
+    p = subprocess.run(args, capture_output=True, text=True)
+    errors = []
+    rx = VB_ERR_RE if vb else ERR_RE
+    for line in (p.stdout + '\n' + p.stderr).splitlines():
+        m = rx.match(line.strip())
+        if m and m.group('sev') == 'error':
+            f = m.group('file')
+            f = os.path.basename(f) if f == srcfile else map_label(f, labels)
+            col = '' if vb else f",{m.group('col')}"
+            errors.append(f"{f}({m.group('line')}{col}): {m.group('code')} {m.group('msg')}")
+    ok = p.returncode == 0 and not errors
+    if not ok and not errors:
+        errors = [l for l in (p.stdout + p.stderr).splitlines() if l.strip()][:10]
+    return ok, errors
+
+
+def check_dir(base, ref_dirs=(), cfg=None, keep=False):
+    cfg = dict(cfg or {})
+    ref_dirs = list(ref_dirs or cfg.get('ref_dirs') or [])
+    compilers = {'csharp': find_compiler(cfg.get('csc'), ref_dirs),
+                 'vb': find_vb_compiler(cfg.get('vbc'), ref_dirs)}
+    print(f"C# compiler: {describe_compiler(compilers['csharp'], ref_dirs)}")
+    print(f"VB compiler: {describe_compiler(compilers['vb'], ref_dirs)}")
+    files = sorted(glob.glob(os.path.join(base, '*.xml')))
+    all_ok = True
+    for fp in files:
+        name = os.path.basename(fp)
+        try:
+            root = ET.parse(fp).getroot()
+        except Exception as e:
+            print(f'[FAIL] {name}: XML error {e}')
+            all_ok = False
+            continue
+        src, lang, n, labels = build_source(root, root.get('name') or name)
+        if src is None:
+            print(f'[ -- ] {name}: no Code Options stage, nothing to compile')
+            continue
+        compiler = compilers.get(lang)
+        if lang not in compilers or not compiler:
+            print(f'[UNCHECKED] {name}: language {lang!r} -- no compiler for it; '
+                  f'do NOT treat this object as verified')
+            all_ok = False
+            continue
+        refs, missing = resolve_refs(root, list(ref_dirs))
+        if missing:
+            print(f'[FAIL] {name}: reference(s) not found {missing} -- pass --ref-dir '
+                  f'(e.g. the Blue Prism install folder)')
+            all_ok = False
+            continue
+        work = tempfile.mkdtemp(prefix='bpcc_')
+        ok, errors = compile_source(compiler, src, refs, work, lang, cfg, labels)
+        tag = 'VB' if lang == 'vb' else 'C#'
+        if ok:
+            print(f'[OK  ] {name}: {tag}, {n} code stage(s) + shared code compiled')
+        else:
+            all_ok = False
+            print(f'[FAIL] {name}: {tag}, {len(errors)} compile error(s)')
+            for e in errors[:15]:
+                print(f'       {e}')
+            if len(errors) > 15:
+                print(f'       ... {len(errors) - 15} more')
+        if keep:
+            print(f'       source kept: {work}')
+        else:
+            shutil.rmtree(work, ignore_errors=True)
+    print('ALL COMPILED' if all_ok else 'COMPILE PROBLEMS')
+    return all_ok
+
+
+SELF_TEST_CASES = {
+    'csharp': ('static int Helper() { return 1; }',
+               'Total = Rows.Rows.Count + Helper();',
+               'Total = Rows.Rows.Count + ThisDoesNotExist;'),
+    'visualbasic': ('Shared Function Helper() As Integer\n  Return 1\nEnd Function',
+                    'Total = Rows.Rows.Count + Helper()',
+                    'Total = Rows.Rows.Count + ThisDoesNotExist'),
+}
+
+
+def self_test(cfg=None):
+    """Positive control per language: a broken stage MUST fail and name the stage;
+    a good one MUST pass. A language with no compiler is reported, not passed."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from bp_gen import Proc
+    import io, contextlib
+    results = {}
+    for lang, (shared, good_body, bad_body) in SELF_TEST_CASES.items():
+        tmp = tempfile.mkdtemp(prefix='bpcc_selftest_')
+        try:
+            good, bad = os.path.join(tmp, 'good'), os.path.join(tmp, 'bad')
+            for d, body in ((good, good_body), (bad, bad_body)):
+                p = Proc('Self Test', 'object', 'compile_check positive control')
+                p.code_options(language=lang, globalcode=shared)
+                p.page('Clean Up', 'Standard first object page.', page_type='CleanUp')
+                pg = p.page('Count Rows', 'Count rows.')
+                pg.add_input('collection', 'Rows')
+                pg.code('Compute', body, inputs=[('collection', 'Rows', '[Rows]')],
+                        outputs=[('number', 'Total', 'Total')])
+                p.write('BPA Object - Self Test.xml', outdir=d)
+            print(f'--- {lang}: good object (must compile) ---')
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                ok_good = check_dir(good, cfg=cfg)
+            print(buf.getvalue(), end='')
+            if 'UNCHECKED' in buf.getvalue():
+                results[lang] = None
+                continue
+            print(f'--- {lang}: broken object (must FAIL and name Count Rows/Compute) ---')
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                ok_bad = check_dir(bad, cfg=cfg)
+            print(buf.getvalue(), end='')
+            out_norm = buf.getvalue().replace('\\', '/').lower()
+            named = 'count rows/compute' in out_norm and 'thisdoesnotexist' in out_norm
+            results[lang] = ok_good and not ok_bad and named
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+    print()
+    for lang, r in results.items():
+        print(f'  {lang:12} ' + {True: 'PASS', False: 'FAIL -- the gate is blind for this language',
+                                 None: 'NO COMPILER -- objects in this language stay UNCHECKED'}[r])
+    passed = all(r is not False for r in results.values()) and any(results.values())
+    print('SELF-TEST PASS' if passed else 'SELF-TEST FAIL')
+    return passed
+
+
+if __name__ == '__main__':
+    argv = sys.argv[1:]
+    def opt(flag, multi=False):
+        vals = [argv[i + 1] for i, a in enumerate(argv) if a == flag and i + 1 < len(argv)]
+        return vals if multi else (vals[0] if vals else None)
+    cfg = {'csc': opt('--csc'), 'vbc': opt('--vbc'), 'vbruntime': opt('--vbruntime'),
+           'langversion': opt('--langversion'), 'option_strict': '--option-strict' in argv,
+           'ref_dirs': opt('--ref-dir', True)}
+    if '--self-test' in argv:
+        sys.exit(0 if self_test(cfg) else 1)
+    valued = {'--csc', '--vbc', '--vbruntime', '--langversion', '--ref-dir'}
+    pos = [a for i, a in enumerate(argv)
+           if not a.startswith('--') and not (i > 0 and argv[i - 1] in valued)]
+    ok = check_dir(pos[0] if pos else 'out', ref_dirs=opt('--ref-dir', True), cfg=cfg,
+                   keep='--keep' in argv)
+    sys.exit(0 if ok else 1)
