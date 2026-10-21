@@ -1,0 +1,4 @@
+python migrate.py --process m.bprelease --objects r.bprelease -o out_bpmn
+python audit3.py out_bpmn
+python tools/bpmn_lint.py out_bpmn
+python port/bp_equiv.py m.bprelease r.bprelease --objects --per-artifact
