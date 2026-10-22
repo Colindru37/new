@@ -1,0 +1,6 @@
+SELECT COUNT(*) AS rows_now, MIN(startdatetime) AS oldest, MAX(startdatetime) AS newest
+FROM dbo.BPASession;
+
+SELECT TOP 20 sessionnumber, sessionid, startdatetime, enddatetime, statusid, laststage, lastupdated
+FROM dbo.BPASession
+ORDER BY sessionnumber DESC;
