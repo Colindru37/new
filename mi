@@ -1,5 +1,0 @@
-Get-ChildItem 'C:\Program Files*' -Recurse -Filter AutomateC.exe -ErrorAction SilentlyContinue | Select-Object FullName
-
-& 'C:\Program Files\Blue Prism Limited\Blue Prism Automate\AutomateC.exe' /help
-
-& '...\AutomateC.exe' /sso /export "Some Process Name" /exportto C:\Temp\test.xml
