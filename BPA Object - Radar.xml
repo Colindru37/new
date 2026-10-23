@@ -1,0 +1,838 @@
+<?xml version="1.0" encoding="utf-8"?>
+<process name="Radar" version="1.0" bpversion="7.2.1.15451" narrative="In-memory flight recorder: Record is free, Dump writes one incident folder (trail, data items at failure, screenshot) only when something fails." byrefcollection="true" processrunningmessage="" disableversioning="false" type="object" runmode="Exclusive" preferredid="1494aa57-8f42-55d1-914f-c4d857f8beef">
+<subsheet subsheetid="d3e2783c-237d-511b-9324-4fb6e3dd5570" type="CleanUp" published="true">
+  <name>Clean Up</name>
+</subsheet>
+<subsheet subsheetid="e952d983-3a86-5feb-bf39-ef278055d197" type="Normal" published="true">
+  <name>Configure Radar</name>
+</subsheet>
+<subsheet subsheetid="681b6fec-bf02-5963-b354-8c5daac58052" type="Normal" published="true">
+  <name>Record Event</name>
+</subsheet>
+<subsheet subsheetid="e15212db-be0d-5357-8315-f0d1fe367c46" type="Normal" published="true">
+  <name>Dump Incident</name>
+</subsheet>
+<subsheet subsheetid="18fae05c-abac-5f65-ac94-87315a866753" type="Normal" published="true">
+  <name>Get Trail</name>
+</subsheet>
+<stage stageid="bee03323-a655-588f-9b17-6a12cf8aaf15" name="Code Options" type="ProcessInfo">
+  <display x="-345" y="-255" w="150" h="90" />
+  <references>
+    <reference>System.dll</reference>
+    <reference>System.Data.dll</reference>
+    <reference>System.Xml.dll</reference>
+    <reference>System.Drawing.dll</reference>
+    <reference>System.Core.dll</reference>
+  </references>
+  <imports>
+    <import>System</import>
+    <import>System.Collections.Generic</import>
+    <import>System.Data</import>
+    <import>System.Globalization</import>
+    <import>System.IO</import>
+    <import>System.Linq</import>
+    <import>System.Runtime.InteropServices</import>
+    <import>System.Text</import>
+  </imports>
+  <language>csharp</language>
+  <globalcode><![CDATA[]]></globalcode>
+  <code><![CDATA[
+public static class RadarCore
+{
+    public class Entry
+    {
+        public long Seq;
+        public DateTime At;
+        public string Label;
+        public string Detail;
+    }
+
+    // One ring per session. A Blue Prism resource runs each session on its own thread, so the
+    // ring is keyed by the calling thread: two sessions on one resource never mix trails.
+    // (To verify on the first BP run: that every action call of one session arrives on the same thread.)
+    class Ring
+    {
+        public readonly List<Entry> Entries = new List<Entry>();
+        public long Seq = 0;
+        public long Dropped = 0;
+        public string LastDumpKey;      // exception detail+stage of the last dump of this session
+        public string LastDumpFolder;
+        public DateTime LastDumpAt;
+    }
+    const int DedupeSeconds = 120;
+
+    static readonly object Gate = new object();
+    static readonly Dictionary<int, Ring> Rings = new Dictionary<int, Ring>();
+    static int _capacity = 50;
+    static string _root = null;
+
+    static Ring Mine()
+    {
+        int id = System.Threading.Thread.CurrentThread.ManagedThreadId;
+        Ring r;
+        if (!Rings.TryGetValue(id, out r)) { r = new Ring(); Rings[id] = r; }
+        return r;
+    }
+
+    static void Trim(Ring r)
+    {
+        while (r.Entries.Count > _capacity) { r.Entries.RemoveAt(0); r.Dropped++; }
+    }
+
+    public static int Capacity { get { lock (Gate) return _capacity; } }
+    public static string Root { get { lock (Gate) return _root ?? Path.Combine(Path.GetTempPath(), "Radar"); } }
+    public static int SessionCount { get { lock (Gate) return Rings.Count; } }
+
+    /// Set the incident root folder (a UNC share in production) and the ring capacity. Empty/zero keep the defaults.
+    public static void Configure(string rootFolder, int capacity)
+    {
+        lock (Gate)
+        {
+            if (!string.IsNullOrEmpty(rootFolder)) _root = rootFolder;
+            if (capacity > 0) _capacity = capacity;
+            foreach (var r in Rings.Values) Trim(r);
+        }
+    }
+
+    /// Append one entry to this session's ring; the oldest falls off past Capacity. Cheap: no I/O.
+    public static void Record(string label, string detail)
+    {
+        lock (Gate)
+        {
+            var r = Mine();
+            r.Seq++;
+            r.Entries.Add(new Entry { Seq = r.Seq, At = DateTime.Now, Label = label ?? "", Detail = detail ?? "" });
+            Trim(r);
+        }
+    }
+
+    public static int Count { get { lock (Gate) return Mine().Entries.Count; } }
+    public static long Dropped { get { lock (Gate) return Mine().Dropped; } }
+
+    /// This session's trail as text, oldest first, one line per entry.
+    public static string Trail()
+    {
+        lock (Gate)
+        {
+            var sb = new StringBuilder();
+            foreach (var e in Mine().Entries)
+                sb.Append(Line(e)).Append('\n');
+            return sb.ToString();
+        }
+    }
+
+    /// Forget this session's ring (called after a dump; also the right call at Clean Up).
+    public static void Clear()
+    {
+        lock (Gate) { Rings.Remove(System.Threading.Thread.CurrentThread.ManagedThreadId); }
+    }
+
+    static string Line(Entry e)
+    {
+        return e.At.ToString("HH:mm:ss.fff", CultureInfo.InvariantCulture) + " | #" + e.Seq + " | " + e.Label + " | " + e.Detail.Replace("\r", "").Replace("\n", " \\n ");
+    }
+
+    /// Write one incident folder: incident.txt + incident.json (+ screenshot.png on Windows), then clear this session's ring.
+    /// Returns the folder path, or "ERROR: ..." when even the folder could not be written. Never throws.
+    public static string Dump(string process, string page, string exType, string exDetail, string exStage, string dataItems, bool captureScreen)
+    {
+        try
+        {
+            var now = DateTime.Now;
+            List<Entry> snapshot; long dropped; int cap;
+            // Dedupe key = type + detail ONLY. Blue Prism reports a different ExceptionStage() at each
+            // level (the inner stage in the object, the calling Action stage in the process -- seen on the
+            // estate 2026-10-23), so the stage must not be part of the key.
+            string key = (exType ?? "") + "\u0001" + (exDetail ?? "");
+            lock (Gate)
+            {
+                var r = Mine();
+                // The same exception reaches Dump twice when an instrumented object dumps and then the
+                // process's logger dumps on the rethrow: one incident folder, not two.
+                if (r.LastDumpKey == key && (now - r.LastDumpAt).TotalSeconds < DedupeSeconds && r.LastDumpFolder != null)
+                {
+                    // the later caller (usually the process's logger) may be the one that wants the screenshot
+                    var shot = Path.Combine(r.LastDumpFolder, "screenshot.png");
+                    if (captureScreen && !File.Exists(shot) && Directory.Exists(r.LastDumpFolder))
+                    {
+                        var note = Screenshot(shot);
+                        try { File.AppendAllText(Path.Combine(r.LastDumpFolder, "incident.txt"),
+                                                 "\nscreenshot: " + (note == "ok" ? "screenshot.png (taken by a later dump of the same exception)" : "skipped (" + note + ")") + "\n", new UTF8Encoding(false)); }
+                        catch (Exception) { }
+                    }
+                    return r.LastDumpFolder;
+                }
+                snapshot = new List<Entry>(r.Entries); dropped = r.Dropped; cap = _capacity;
+            }
+            // <root>\<resource machine>\<time>_<process>_<stage>: the Control Room row (time, resource, stage) finds it
+            var folder = Path.Combine(Path.Combine(Root, Safe(Environment.MachineName)),
+                                      now.ToString("yyyyMMdd_HHmmss_fff", CultureInfo.InvariantCulture) + "_" + Safe(process) + "_" + Safe(exStage));
+            for (int n = 2; Directory.Exists(folder); n++)          // two incidents in the same millisecond never share a folder
+                folder = folder.TrimEnd('0','1','2','3','4','5','6','7','8','9','~') + "~" + n;
+            Directory.CreateDirectory(folder);
+
+            string shotNote;
+            string shotFile = null;
+            if (captureScreen)
+            {
+                shotFile = Path.Combine(folder, "screenshot.png");
+                shotNote = Screenshot(shotFile);
+                if (shotNote != "ok") shotFile = null;
+            }
+            else shotNote = "not requested";
+
+            var txt = new StringBuilder();
+            txt.Append("RADAR INCIDENT ").Append(now.ToString("yyyy-MM-dd HH:mm:ss.fff", CultureInfo.InvariantCulture)).Append('\n');
+            txt.Append("process   : ").Append(process).Append('\n');
+            txt.Append("page      : ").Append(page).Append('\n');
+            txt.Append("machine   : ").Append(Environment.MachineName).Append(" / ").Append(Environment.UserName).Append('\n');
+            txt.Append("exception : ").Append(exType).Append('\n');
+            txt.Append("stage     : ").Append(exStage).Append('\n');
+            txt.Append("detail    : ").Append(exDetail).Append('\n');
+            txt.Append("screenshot: ").Append(shotFile != null ? "screenshot.png" : "skipped (" + shotNote + ")").Append('\n');
+            txt.Append("\n--- data items at failure ---\n").Append(dataItems ?? "").Append(dataItems != null && dataItems.EndsWith("\n") ? "" : "\n");
+            txt.Append("\n--- trail (oldest first; ").Append(snapshot.Count).Append(" kept, ").Append(dropped).Append(" dropped, capacity ").Append(cap).Append(") ---\n");
+            foreach (var e in snapshot) txt.Append(Line(e)).Append('\n');
+            File.WriteAllText(Path.Combine(folder, "incident.txt"), txt.ToString(), new UTF8Encoding(false));
+
+            var js = new StringBuilder();
+            js.Append("{\n");
+            js.Append("  \"at\": ").Append(J(now.ToString("o"))).Append(",\n");
+            js.Append("  \"process\": ").Append(J(process)).Append(",\n");
+            js.Append("  \"page\": ").Append(J(page)).Append(",\n");
+            js.Append("  \"machine\": ").Append(J(Environment.MachineName)).Append(",\n");
+            js.Append("  \"user\": ").Append(J(Environment.UserName)).Append(",\n");
+            js.Append("  \"exception\": { \"type\": ").Append(J(exType)).Append(", \"stage\": ").Append(J(exStage)).Append(", \"detail\": ").Append(J(exDetail)).Append(" },\n");
+            js.Append("  \"screenshot\": ").Append(shotFile != null ? J("screenshot.png") : "null").Append(",\n");
+            js.Append("  \"screenshot_note\": ").Append(J(shotNote)).Append(",\n");
+            js.Append("  \"data_items\": ").Append(DataItemsJson(dataItems)).Append(",\n");
+            js.Append("  \"dropped\": ").Append(dropped).Append(",\n");
+            js.Append("  \"trail\": [\n");
+            for (int i = 0; i < snapshot.Count; i++)
+            {
+                var e = snapshot[i];
+                js.Append("    { \"seq\": ").Append(e.Seq).Append(", \"at\": ").Append(J(e.At.ToString("o")))
+                  .Append(", \"label\": ").Append(J(e.Label)).Append(", \"detail\": ").Append(J(e.Detail)).Append(" }")
+                  .Append(i + 1 < snapshot.Count ? ",\n" : "\n");
+            }
+            js.Append("  ]\n}\n");
+            File.WriteAllText(Path.Combine(folder, "incident.json"), js.ToString(), new UTF8Encoding(false));
+
+            lock (Gate)
+            {
+                Rings.Remove(System.Threading.Thread.CurrentThread.ManagedThreadId);
+                var fresh = Mine();
+                fresh.LastDumpKey = key; fresh.LastDumpFolder = folder; fresh.LastDumpAt = now;
+            }
+            return folder;
+        }
+        catch (Exception ex)
+        {
+            return "ERROR: " + ex.GetType().Name + ": " + ex.Message;
+        }
+    }
+
+    /// "name=value" lines -> JSON object. A line without '=' becomes a key with null.
+    static string DataItemsJson(string dataItems)
+    {
+        var sb = new StringBuilder("{");
+        bool first = true;
+        foreach (var raw in (dataItems ?? "").Replace("\r", "").Split('\n'))
+        {
+            var line = raw.Trim();
+            if (line.Length == 0) continue;
+            int eq = line.IndexOf('=');
+            string k = eq < 0 ? line : line.Substring(0, eq).Trim();
+            string v = eq < 0 ? null : line.Substring(eq + 1);
+            sb.Append(first ? " " : ", ").Append(J(k)).Append(": ").Append(v == null ? "null" : J(v));
+            first = false;
+        }
+        return sb.Append(first ? "}" : " }").ToString();
+    }
+
+    static string J(string s)
+    {
+        if (s == null) return "null";
+        var sb = new StringBuilder("\"");
+        foreach (var c in s)
+        {
+            switch (c)
+            {
+                case '"': sb.Append("\\\""); break;
+                case '\\': sb.Append("\\\\"); break;
+                case '\n': sb.Append("\\n"); break;
+                case '\r': sb.Append("\\r"); break;
+                case '\t': sb.Append("\\t"); break;
+                default:
+                    if (c < ' ') sb.Append("\\u").Append(((int)c).ToString("x4"));
+                    else sb.Append(c);
+                    break;
+            }
+        }
+        return sb.Append('"').ToString();
+    }
+
+    static string Safe(string s)
+    {
+        if (string.IsNullOrEmpty(s)) return "x";
+        var sb = new StringBuilder();
+        foreach (var c in s)
+            sb.Append(char.IsLetterOrDigit(c) ? c : '_');
+        var r = sb.ToString().Trim('_');
+        return r.Length > 40 ? r.Substring(0, 40) : (r.Length == 0 ? "x" : r);
+    }
+
+    // ---- screenshot: whole virtual desktop via GDI+, Windows only; any failure is reported, never thrown ----
+    [DllImport("user32.dll")] static extern int GetSystemMetrics(int n);
+    const int SM_XVIRTUALSCREEN = 76, SM_YVIRTUALSCREEN = 77, SM_CXVIRTUALSCREEN = 78, SM_CYVIRTUALSCREEN = 79;
+
+    static string Screenshot(string file)
+    {
+        if (Environment.OSVersion.Platform != PlatformID.Win32NT) return "not Windows (" + Environment.OSVersion.Platform + ")";
+        try
+        {
+            int x = GetSystemMetrics(SM_XVIRTUALSCREEN), y = GetSystemMetrics(SM_YVIRTUALSCREEN);
+            int w = GetSystemMetrics(SM_CXVIRTUALSCREEN), h = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+            if (w <= 0 || h <= 0) return "no screen (" + w + "x" + h + ")";
+            using (var bmp = new System.Drawing.Bitmap(w, h))
+            {
+                using (var g = System.Drawing.Graphics.FromImage(bmp))
+                    g.CopyFromScreen(x, y, 0, 0, new System.Drawing.Size(w, h));
+                bmp.Save(file, System.Drawing.Imaging.ImageFormat.Png);
+            }
+            return "ok";
+        }
+        catch (Exception ex)
+        {
+            return ex.GetType().Name + ": " + ex.Message;
+        }
+    }
+}
+]]></code>
+</stage>
+<stage stageid="d4ed5da1-2ddf-5578-ae30-54eb20eb3236" name="Start" type="Start">
+  <display x="15" y="-30" w="60" h="30" />
+  <font family="Segoe UI" size="10" style="Regular" color="000000" />
+  <onsuccess>d24ccf85-0a7d-5391-884d-bc026c8ad97e</onsuccess>
+</stage>
+<stage stageid="d24ccf85-0a7d-5391-884d-bc026c8ad97e" name="End" type="End">
+  <display x="15" y="30" w="60" h="30" />
+  <font family="Segoe UI" size="10" style="Regular" color="000000" />
+</stage>
+<stage stageid="ff4d5694-b534-54e8-84bd-e0ef866f681b" name="Clean Up" type="SubSheetInfo">
+  <subsheetid>d3e2783c-237d-511b-9324-4fb6e3dd5570</subsheetid>
+  <narrative>Standard first object page.</narrative>
+  <display x="-345" y="-135" w="220" h="120" />
+  <font family="Segoe UI" size="10" style="Bold" color="3366FF" />
+  <published>true</published>
+</stage>
+<stage stageid="02bf6d25-6cad-5dd4-ae63-313d4712309f" name="Start" type="Start">
+  <subsheetid>d3e2783c-237d-511b-9324-4fb6e3dd5570</subsheetid>
+  <display x="15" y="-30" w="60" h="30" />
+  <font family="Segoe UI" size="10" style="Regular" color="000000" />
+  <onsuccess>eeba808e-4bb9-5102-bd6a-847e4206bfc5</onsuccess>
+</stage>
+<stage stageid="eeba808e-4bb9-5102-bd6a-847e4206bfc5" name="End" type="End">
+  <subsheetid>d3e2783c-237d-511b-9324-4fb6e3dd5570</subsheetid>
+  <display x="15" y="30" w="60" h="30" />
+  <font family="Segoe UI" size="10" style="Regular" color="000000" />
+</stage>
+<stage stageid="48900888-a8da-5111-8fc1-90e4a443c267" name="Configure Radar" type="SubSheetInfo">
+  <subsheetid>e952d983-3a86-5feb-bf39-ef278055d197</subsheetid>
+  <narrative>Set the incident root folder and ring capacity. Empty folder / zero capacity keep the defaults (%TEMP%\Radar, 50).</narrative>
+  <display x="-345" y="-135" w="220" h="120" />
+  <font family="Segoe UI" size="10" style="Bold" color="3366FF" />
+  <published>true</published>
+</stage>
+<stage stageid="020f62aa-69ba-5520-8a97-cb361890ad29" name="Start" type="Start">
+  <subsheetid>e952d983-3a86-5feb-bf39-ef278055d197</subsheetid>
+  <display x="15" y="-30" w="60" h="30" />
+  <font family="Segoe UI" size="10" style="Regular" color="000000" />
+  <inputs>
+    <input type="text" name="Root Folder" friendlyname="Root Folder" stage="Root Folder" />
+    <input type="number" name="Capacity" friendlyname="Capacity" stage="Capacity" />
+  </inputs>
+  <onsuccess>ec2a2c35-9b9d-514e-88ef-1eff926a542a</onsuccess>
+</stage>
+<stage stageid="ec2a2c35-9b9d-514e-88ef-1eff926a542a" name="Run Configure Radar" type="Code">
+  <subsheetid>e952d983-3a86-5feb-bf39-ef278055d197</subsheetid>
+  <display x="15" y="30" w="150" h="30" />
+  <font family="Segoe UI" size="10" style="Regular" color="000000" />
+  <inputs>
+    <input type="text" name="Root_Folder" expr="[Root Folder]" />
+    <input type="number" name="Capacity" expr="[Capacity]" />
+  </inputs>
+  <outputs>
+    <output type="text" name="Error_Text" stage="Error Text" />
+  </outputs>
+  <onsuccess>e4401195-2edc-5fdd-8247-a89ecac75f84</onsuccess>
+  <code><![CDATA[Error_Text = "";
+try
+{
+    RadarCore.Configure(Root_Folder, (int)Capacity);
+}
+catch (Exception ex)
+{
+    Error_Text = "Configure Radar: " + ex.Message;
+}]]></code>
+</stage>
+<stage stageid="e4401195-2edc-5fdd-8247-a89ecac75f84" name="Succeeded?" type="Decision">
+  <subsheetid>e952d983-3a86-5feb-bf39-ef278055d197</subsheetid>
+  <loginhibit />
+  <display x="15" y="90" w="150" h="30" />
+  <font family="Segoe UI" size="10" style="Regular" color="000000" />
+  <decision expression="[Error Text] = &quot;&quot;" />
+  <ontrue>d4cf852e-6ffe-5083-8989-6a0812d6d0f5</ontrue>
+  <onfalse>ca0ba8e0-44b1-57fc-a067-d1a08dc0fc36</onfalse>
+</stage>
+<stage stageid="ca0ba8e0-44b1-57fc-a067-d1a08dc0fc36" name="Raise Error" type="Exception">
+  <subsheetid>e952d983-3a86-5feb-bf39-ef278055d197</subsheetid>
+  <loginhibit onsuccess="true" />
+  <display x="15" y="150" w="150" h="30" />
+  <font family="Segoe UI" size="10" style="Regular" color="000000" />
+  <exception type="System Exception" detail="[Error Text]" />
+</stage>
+<stage stageid="9c82fcde-07fd-54d9-b0af-34065dafb435" name="End" type="End">
+  <subsheetid>e952d983-3a86-5feb-bf39-ef278055d197</subsheetid>
+  <display x="15" y="210" w="60" h="30" />
+  <font family="Segoe UI" size="10" style="Regular" color="000000" />
+</stage>
+<stage stageid="d4cf852e-6ffe-5083-8989-6a0812d6d0f5" name="Succeeded? yes to End" type="Anchor">
+  <subsheetid>e952d983-3a86-5feb-bf39-ef278055d197</subsheetid>
+  <loginhibit />
+  <display x="150" y="90" w="10" h="10" />
+  <onsuccess>a9fc0194-0208-571d-ae2c-3f9d7ea80820</onsuccess>
+</stage>
+<stage stageid="a9fc0194-0208-571d-ae2c-3f9d7ea80820" name="Succeeded? yes to End (arrive)" type="Anchor">
+  <subsheetid>e952d983-3a86-5feb-bf39-ef278055d197</subsheetid>
+  <loginhibit />
+  <display x="150" y="210" w="10" h="10" />
+  <onsuccess>9c82fcde-07fd-54d9-b0af-34065dafb435</onsuccess>
+</stage>
+<stage stageid="2570f042-e47a-5f93-8a62-be7cdca93c9f" name="Input Variables" type="Block">
+  <subsheetid>e952d983-3a86-5feb-bf39-ef278055d197</subsheetid>
+  <display x="210" y="-60" w="180" h="120" />
+  <font family="Segoe UI" size="10" style="Regular" color="7FB2E5" />
+</stage>
+<stage stageid="1ddcdd2f-1228-5373-8b19-c4001b2d3f63" name="Capacity" type="Data">
+  <subsheetid>e952d983-3a86-5feb-bf39-ef278055d197</subsheetid>
+  <display x="300" y="-30" w="120" h="30" />
+  <font family="Segoe UI" size="10" style="Regular" color="000000" />
+  <datatype>number</datatype>
+  <initialvalue>0</initialvalue>
+  <private />
+  <alwaysinit />
+</stage>
+<stage stageid="da8469c3-3913-5442-9795-f7fc43d70df0" name="Root Folder" type="Data">
+  <subsheetid>e952d983-3a86-5feb-bf39-ef278055d197</subsheetid>
+  <display x="300" y="15" w="120" h="30" />
+  <font family="Segoe UI" size="10" style="Regular" color="000000" />
+  <datatype>text</datatype>
+  <initialvalue></initialvalue>
+  <private />
+  <alwaysinit />
+</stage>
+<stage stageid="6cc59b56-bd76-5d7c-ae07-a2bafdc97893" name="Local Variables" type="Block">
+  <subsheetid>e952d983-3a86-5feb-bf39-ef278055d197</subsheetid>
+  <display x="210" y="90" w="180" h="75" />
+  <font family="Segoe UI" size="10" style="Regular" color="7FB2E5" />
+</stage>
+<stage stageid="c6ad846b-0b5e-57a3-96e0-01ad593e8e07" name="Error Text" type="Data">
+  <subsheetid>e952d983-3a86-5feb-bf39-ef278055d197</subsheetid>
+  <display x="300" y="120" w="120" h="30" />
+  <font family="Segoe UI" size="10" style="Regular" color="000000" />
+  <datatype>text</datatype>
+  <initialvalue></initialvalue>
+  <private />
+  <alwaysinit />
+</stage>
+<stage stageid="2bfa6e66-3c69-5361-99e4-398ae8eee6dd" name="Record Event" type="SubSheetInfo">
+  <subsheetid>681b6fec-bf02-5963-b354-8c5daac58052</subsheetid>
+  <narrative>Append one entry to the ring (label + detail). No I/O; the oldest entry falls off past capacity.</narrative>
+  <display x="-345" y="-135" w="220" h="120" />
+  <font family="Segoe UI" size="10" style="Bold" color="3366FF" />
+  <published>true</published>
+</stage>
+<stage stageid="8512f0b8-ba37-5735-a79c-3ccad5363fd3" name="Start" type="Start">
+  <subsheetid>681b6fec-bf02-5963-b354-8c5daac58052</subsheetid>
+  <display x="15" y="-30" w="60" h="30" />
+  <font family="Segoe UI" size="10" style="Regular" color="000000" />
+  <inputs>
+    <input type="text" name="Label" friendlyname="Label" stage="Label" />
+    <input type="text" name="Detail" friendlyname="Detail" stage="Detail" />
+  </inputs>
+  <onsuccess>2caa5dc8-58ef-5e34-bce4-e96c2dc8f792</onsuccess>
+</stage>
+<stage stageid="2caa5dc8-58ef-5e34-bce4-e96c2dc8f792" name="Run Record Event" type="Code">
+  <subsheetid>681b6fec-bf02-5963-b354-8c5daac58052</subsheetid>
+  <display x="15" y="30" w="150" h="30" />
+  <font family="Segoe UI" size="10" style="Regular" color="000000" />
+  <inputs>
+    <input type="text" name="Label" expr="[Label]" />
+    <input type="text" name="Detail" expr="[Detail]" />
+  </inputs>
+  <outputs>
+    <output type="text" name="Error_Text" stage="Error Text" />
+  </outputs>
+  <onsuccess>ddafaee9-6158-5c32-a8e5-34e401bc8726</onsuccess>
+  <code><![CDATA[Error_Text = "";
+try
+{
+    RadarCore.Record(Label, Detail);
+}
+catch (Exception ex)
+{
+    Error_Text = "Record Event: " + ex.Message;
+}]]></code>
+</stage>
+<stage stageid="ddafaee9-6158-5c32-a8e5-34e401bc8726" name="Succeeded?" type="Decision">
+  <subsheetid>681b6fec-bf02-5963-b354-8c5daac58052</subsheetid>
+  <loginhibit />
+  <display x="15" y="90" w="150" h="30" />
+  <font family="Segoe UI" size="10" style="Regular" color="000000" />
+  <decision expression="[Error Text] = &quot;&quot;" />
+  <ontrue>a66ca19a-1c61-5938-9ef3-01926db9cdcb</ontrue>
+  <onfalse>745cc307-9b2a-54a4-8cd5-d6808ab32347</onfalse>
+</stage>
+<stage stageid="745cc307-9b2a-54a4-8cd5-d6808ab32347" name="Raise Error" type="Exception">
+  <subsheetid>681b6fec-bf02-5963-b354-8c5daac58052</subsheetid>
+  <loginhibit onsuccess="true" />
+  <display x="15" y="150" w="150" h="30" />
+  <font family="Segoe UI" size="10" style="Regular" color="000000" />
+  <exception type="System Exception" detail="[Error Text]" />
+</stage>
+<stage stageid="e3d69b39-63cc-52a9-9a5d-43733411fcf1" name="End" type="End">
+  <subsheetid>681b6fec-bf02-5963-b354-8c5daac58052</subsheetid>
+  <display x="15" y="210" w="60" h="30" />
+  <font family="Segoe UI" size="10" style="Regular" color="000000" />
+</stage>
+<stage stageid="a66ca19a-1c61-5938-9ef3-01926db9cdcb" name="Succeeded? yes to End" type="Anchor">
+  <subsheetid>681b6fec-bf02-5963-b354-8c5daac58052</subsheetid>
+  <loginhibit />
+  <display x="150" y="90" w="10" h="10" />
+  <onsuccess>050c41a0-7f72-5674-8319-5ae83280a283</onsuccess>
+</stage>
+<stage stageid="050c41a0-7f72-5674-8319-5ae83280a283" name="Succeeded? yes to End (arrive)" type="Anchor">
+  <subsheetid>681b6fec-bf02-5963-b354-8c5daac58052</subsheetid>
+  <loginhibit />
+  <display x="150" y="210" w="10" h="10" />
+  <onsuccess>e3d69b39-63cc-52a9-9a5d-43733411fcf1</onsuccess>
+</stage>
+<stage stageid="1a3463c9-60aa-5e03-aef8-e1d6ac6da35b" name="Input Variables" type="Block">
+  <subsheetid>681b6fec-bf02-5963-b354-8c5daac58052</subsheetid>
+  <display x="210" y="-60" w="180" h="120" />
+  <font family="Segoe UI" size="10" style="Regular" color="7FB2E5" />
+</stage>
+<stage stageid="268fbd4f-7c11-5492-8024-83a285edac25" name="Detail" type="Data">
+  <subsheetid>681b6fec-bf02-5963-b354-8c5daac58052</subsheetid>
+  <display x="300" y="-30" w="120" h="30" />
+  <font family="Segoe UI" size="10" style="Regular" color="000000" />
+  <datatype>text</datatype>
+  <initialvalue></initialvalue>
+  <private />
+  <alwaysinit />
+</stage>
+<stage stageid="e92c8129-b6e1-5ee5-aced-92fc9c001f9f" name="Label" type="Data">
+  <subsheetid>681b6fec-bf02-5963-b354-8c5daac58052</subsheetid>
+  <display x="300" y="15" w="120" h="30" />
+  <font family="Segoe UI" size="10" style="Regular" color="000000" />
+  <datatype>text</datatype>
+  <initialvalue></initialvalue>
+  <private />
+  <alwaysinit />
+</stage>
+<stage stageid="b8dfc15d-1d7e-5233-bf89-1f772ad5c256" name="Local Variables" type="Block">
+  <subsheetid>681b6fec-bf02-5963-b354-8c5daac58052</subsheetid>
+  <display x="210" y="90" w="180" h="75" />
+  <font family="Segoe UI" size="10" style="Regular" color="7FB2E5" />
+</stage>
+<stage stageid="4fec97da-440e-5fc6-9d59-6ee9d6823991" name="Error Text" type="Data">
+  <subsheetid>681b6fec-bf02-5963-b354-8c5daac58052</subsheetid>
+  <display x="300" y="120" w="120" h="30" />
+  <font family="Segoe UI" size="10" style="Regular" color="000000" />
+  <datatype>text</datatype>
+  <initialvalue></initialvalue>
+  <private />
+  <alwaysinit />
+</stage>
+<stage stageid="7ae15137-1a0a-5220-b4d3-da7537950824" name="Dump Incident" type="SubSheetInfo">
+  <subsheetid>e15212db-be0d-5357-8315-f0d1fe367c46</subsheetid>
+  <narrative>Write the incident folder: trail, data items at failure, exception, screenshot. Clears the ring. Never throws; Dump Folder starts with ERROR: when the folder could not be written.</narrative>
+  <display x="-345" y="-135" w="220" h="120" />
+  <font family="Segoe UI" size="10" style="Bold" color="3366FF" />
+  <published>true</published>
+</stage>
+<stage stageid="f88c71ab-9627-5d80-ba34-46e8ceaefbfd" name="Start" type="Start">
+  <subsheetid>e15212db-be0d-5357-8315-f0d1fe367c46</subsheetid>
+  <display x="15" y="-30" w="60" h="30" />
+  <font family="Segoe UI" size="10" style="Regular" color="000000" />
+  <inputs>
+    <input type="text" name="Process" friendlyname="Process" stage="Process" />
+    <input type="text" name="Page" friendlyname="Page" stage="Page" />
+    <input type="text" name="Exception Type" friendlyname="Exception Type" stage="Exception Type" />
+    <input type="text" name="Exception Detail" friendlyname="Exception Detail" stage="Exception Detail" />
+    <input type="text" name="Exception Stage" friendlyname="Exception Stage" stage="Exception Stage" />
+    <input type="text" name="Data Items" friendlyname="Data Items" stage="Data Items" />
+    <input type="flag" name="Capture Screen" friendlyname="Capture Screen" stage="Capture Screen" />
+  </inputs>
+  <onsuccess>2be427bc-625d-5e42-bf90-58d8746c70e0</onsuccess>
+</stage>
+<stage stageid="2be427bc-625d-5e42-bf90-58d8746c70e0" name="Run Dump Incident" type="Code">
+  <subsheetid>e15212db-be0d-5357-8315-f0d1fe367c46</subsheetid>
+  <display x="15" y="30" w="150" h="30" />
+  <font family="Segoe UI" size="10" style="Regular" color="000000" />
+  <inputs>
+    <input type="text" name="Process" expr="[Process]" />
+    <input type="text" name="Page" expr="[Page]" />
+    <input type="text" name="Exception_Type" expr="[Exception Type]" />
+    <input type="text" name="Exception_Detail" expr="[Exception Detail]" />
+    <input type="text" name="Exception_Stage" expr="[Exception Stage]" />
+    <input type="text" name="Data_Items" expr="[Data Items]" />
+    <input type="flag" name="Capture_Screen" expr="[Capture Screen]" />
+  </inputs>
+  <outputs>
+    <output type="text" name="Dump_Folder" stage="Dump Folder" />
+    <output type="text" name="Error_Text" stage="Error Text" />
+  </outputs>
+  <onsuccess>959b921b-1816-5fbe-9788-9b3e10515d29</onsuccess>
+  <code><![CDATA[Error_Text = "";
+Dump_Folder = "";
+try
+{
+    Dump_Folder = RadarCore.Dump(Process, Page, Exception_Type, Exception_Detail, Exception_Stage, Data_Items, Capture_Screen);
+}
+catch (Exception ex)
+{
+    Error_Text = "Dump Incident: " + ex.Message;
+}]]></code>
+</stage>
+<stage stageid="959b921b-1816-5fbe-9788-9b3e10515d29" name="Succeeded?" type="Decision">
+  <subsheetid>e15212db-be0d-5357-8315-f0d1fe367c46</subsheetid>
+  <loginhibit />
+  <display x="15" y="90" w="150" h="30" />
+  <font family="Segoe UI" size="10" style="Regular" color="000000" />
+  <decision expression="[Error Text] = &quot;&quot;" />
+  <ontrue>bf920f0d-4fff-57e7-a211-5ec9fb56dc6f</ontrue>
+  <onfalse>0754a2da-9f62-5eed-b4d6-ad00de243971</onfalse>
+</stage>
+<stage stageid="0754a2da-9f62-5eed-b4d6-ad00de243971" name="Raise Error" type="Exception">
+  <subsheetid>e15212db-be0d-5357-8315-f0d1fe367c46</subsheetid>
+  <loginhibit onsuccess="true" />
+  <display x="15" y="150" w="150" h="30" />
+  <font family="Segoe UI" size="10" style="Regular" color="000000" />
+  <exception type="System Exception" detail="[Error Text]" />
+</stage>
+<stage stageid="ca5ea189-38bb-5858-9563-425f6b0c0caa" name="End" type="End">
+  <subsheetid>e15212db-be0d-5357-8315-f0d1fe367c46</subsheetid>
+  <display x="15" y="210" w="60" h="30" />
+  <font family="Segoe UI" size="10" style="Regular" color="000000" />
+  <outputs>
+    <output type="text" name="Dump Folder" friendlyname="Dump Folder" stage="Dump Folder" />
+  </outputs>
+</stage>
+<stage stageid="bf920f0d-4fff-57e7-a211-5ec9fb56dc6f" name="Succeeded? yes to End" type="Anchor">
+  <subsheetid>e15212db-be0d-5357-8315-f0d1fe367c46</subsheetid>
+  <loginhibit />
+  <display x="150" y="90" w="10" h="10" />
+  <onsuccess>9244319b-9abc-5705-8dae-5d7bcb1c51f3</onsuccess>
+</stage>
+<stage stageid="9244319b-9abc-5705-8dae-5d7bcb1c51f3" name="Succeeded? yes to End (arrive)" type="Anchor">
+  <subsheetid>e15212db-be0d-5357-8315-f0d1fe367c46</subsheetid>
+  <loginhibit />
+  <display x="150" y="210" w="10" h="10" />
+  <onsuccess>ca5ea189-38bb-5858-9563-425f6b0c0caa</onsuccess>
+</stage>
+<stage stageid="5fb94542-7b96-5f4e-9ccf-a51ee6ab50a7" name="Input Variables" type="Block">
+  <subsheetid>e15212db-be0d-5357-8315-f0d1fe367c46</subsheetid>
+  <display x="210" y="-60" w="180" h="345" />
+  <font family="Segoe UI" size="10" style="Regular" color="7FB2E5" />
+</stage>
+<stage stageid="187099f6-4f66-55ba-aa4f-ab684309d163" name="Capture Screen" type="Data">
+  <subsheetid>e15212db-be0d-5357-8315-f0d1fe367c46</subsheetid>
+  <display x="300" y="-30" w="120" h="30" />
+  <font family="Segoe UI" size="10" style="Regular" color="000000" />
+  <datatype>flag</datatype>
+  <initialvalue>False</initialvalue>
+  <private />
+  <alwaysinit />
+</stage>
+<stage stageid="f51bae78-6f0f-5293-942a-9b19219af50d" name="Data Items" type="Data">
+  <subsheetid>e15212db-be0d-5357-8315-f0d1fe367c46</subsheetid>
+  <display x="300" y="15" w="120" h="30" />
+  <font family="Segoe UI" size="10" style="Regular" color="000000" />
+  <datatype>text</datatype>
+  <initialvalue></initialvalue>
+  <private />
+  <alwaysinit />
+</stage>
+<stage stageid="200fb824-e25e-5c56-b77e-c440af48d222" name="Exception Detail" type="Data">
+  <subsheetid>e15212db-be0d-5357-8315-f0d1fe367c46</subsheetid>
+  <display x="300" y="60" w="120" h="30" />
+  <font family="Segoe UI" size="10" style="Regular" color="000000" />
+  <datatype>text</datatype>
+  <initialvalue></initialvalue>
+  <private />
+  <alwaysinit />
+</stage>
+<stage stageid="ab4c16b3-685c-58fd-aa0e-0a76ce2be248" name="Exception Stage" type="Data">
+  <subsheetid>e15212db-be0d-5357-8315-f0d1fe367c46</subsheetid>
+  <display x="300" y="105" w="120" h="30" />
+  <font family="Segoe UI" size="10" style="Regular" color="000000" />
+  <datatype>text</datatype>
+  <initialvalue></initialvalue>
+  <private />
+  <alwaysinit />
+</stage>
+<stage stageid="73eab33a-1857-510e-a5da-49e640054781" name="Exception Type" type="Data">
+  <subsheetid>e15212db-be0d-5357-8315-f0d1fe367c46</subsheetid>
+  <display x="300" y="150" w="120" h="30" />
+  <font family="Segoe UI" size="10" style="Regular" color="000000" />
+  <datatype>text</datatype>
+  <initialvalue></initialvalue>
+  <private />
+  <alwaysinit />
+</stage>
+<stage stageid="42912528-8a26-52c2-ab63-855564f6418b" name="Page" type="Data">
+  <subsheetid>e15212db-be0d-5357-8315-f0d1fe367c46</subsheetid>
+  <display x="300" y="195" w="120" h="30" />
+  <font family="Segoe UI" size="10" style="Regular" color="000000" />
+  <datatype>text</datatype>
+  <initialvalue></initialvalue>
+  <private />
+  <alwaysinit />
+</stage>
+<stage stageid="2be9f2ae-c872-5cc8-8cca-1d708ee4f914" name="Process" type="Data">
+  <subsheetid>e15212db-be0d-5357-8315-f0d1fe367c46</subsheetid>
+  <display x="300" y="240" w="120" h="30" />
+  <font family="Segoe UI" size="10" style="Regular" color="000000" />
+  <datatype>text</datatype>
+  <initialvalue></initialvalue>
+  <private />
+  <alwaysinit />
+</stage>
+<stage stageid="ea5eddea-1507-5f60-81a3-02c7c199bea4" name="Output Variables" type="Block">
+  <subsheetid>e15212db-be0d-5357-8315-f0d1fe367c46</subsheetid>
+  <display x="210" y="315" w="180" h="75" />
+  <font family="Segoe UI" size="10" style="Regular" color="7FB2E5" />
+</stage>
+<stage stageid="60444d79-6bf3-5652-9c4e-61499e7879c9" name="Dump Folder" type="Data">
+  <subsheetid>e15212db-be0d-5357-8315-f0d1fe367c46</subsheetid>
+  <display x="300" y="345" w="120" h="30" />
+  <font family="Segoe UI" size="10" style="Regular" color="000000" />
+  <datatype>text</datatype>
+  <initialvalue></initialvalue>
+  <private />
+  <alwaysinit />
+</stage>
+<stage stageid="1186cc41-d910-5323-9fab-88a391ffab3a" name="Local Variables" type="Block">
+  <subsheetid>e15212db-be0d-5357-8315-f0d1fe367c46</subsheetid>
+  <display x="210" y="420" w="180" h="75" />
+  <font family="Segoe UI" size="10" style="Regular" color="7FB2E5" />
+</stage>
+<stage stageid="dd691492-a4bb-55ea-a0b0-82c36ace8aab" name="Error Text" type="Data">
+  <subsheetid>e15212db-be0d-5357-8315-f0d1fe367c46</subsheetid>
+  <display x="300" y="450" w="120" h="30" />
+  <font family="Segoe UI" size="10" style="Regular" color="000000" />
+  <datatype>text</datatype>
+  <initialvalue></initialvalue>
+  <private />
+  <alwaysinit />
+</stage>
+<stage stageid="34287850-48aa-573f-b572-d6b1b480d464" name="Get Trail" type="SubSheetInfo">
+  <subsheetid>18fae05c-abac-5f65-ac94-87315a866753</subsheetid>
+  <narrative>Return the current ring as text, oldest first (inspection / tests).</narrative>
+  <display x="-345" y="-135" w="220" h="120" />
+  <font family="Segoe UI" size="10" style="Bold" color="3366FF" />
+  <published>true</published>
+</stage>
+<stage stageid="0d09fd3d-49fc-5afa-b339-3576211d5c37" name="Start" type="Start">
+  <subsheetid>18fae05c-abac-5f65-ac94-87315a866753</subsheetid>
+  <display x="15" y="-30" w="60" h="30" />
+  <font family="Segoe UI" size="10" style="Regular" color="000000" />
+  <onsuccess>c661e6c5-c7d2-5db1-9692-6a9cdbfecaf3</onsuccess>
+</stage>
+<stage stageid="c661e6c5-c7d2-5db1-9692-6a9cdbfecaf3" name="Run Get Trail" type="Code">
+  <subsheetid>18fae05c-abac-5f65-ac94-87315a866753</subsheetid>
+  <display x="15" y="30" w="150" h="30" />
+  <font family="Segoe UI" size="10" style="Regular" color="000000" />
+  <outputs>
+    <output type="text" name="Trail" stage="Trail" />
+    <output type="text" name="Error_Text" stage="Error Text" />
+  </outputs>
+  <onsuccess>738393a0-6ffd-5008-aa14-987d7ecd73c0</onsuccess>
+  <code><![CDATA[Error_Text = "";
+Trail = "";
+try
+{
+    Trail = RadarCore.Trail();
+}
+catch (Exception ex)
+{
+    Error_Text = "Get Trail: " + ex.Message;
+}]]></code>
+</stage>
+<stage stageid="738393a0-6ffd-5008-aa14-987d7ecd73c0" name="Succeeded?" type="Decision">
+  <subsheetid>18fae05c-abac-5f65-ac94-87315a866753</subsheetid>
+  <loginhibit />
+  <display x="15" y="90" w="150" h="30" />
+  <font family="Segoe UI" size="10" style="Regular" color="000000" />
+  <decision expression="[Error Text] = &quot;&quot;" />
+  <ontrue>dc08d403-ca21-5ebe-9f7f-968f609593f3</ontrue>
+  <onfalse>d55ebefe-e7f2-54cd-ae0f-a48468bf768b</onfalse>
+</stage>
+<stage stageid="d55ebefe-e7f2-54cd-ae0f-a48468bf768b" name="Raise Error" type="Exception">
+  <subsheetid>18fae05c-abac-5f65-ac94-87315a866753</subsheetid>
+  <loginhibit onsuccess="true" />
+  <display x="15" y="150" w="150" h="30" />
+  <font family="Segoe UI" size="10" style="Regular" color="000000" />
+  <exception type="System Exception" detail="[Error Text]" />
+</stage>
+<stage stageid="055f82a0-a15a-596c-90a9-6f50bb2ff81b" name="End" type="End">
+  <subsheetid>18fae05c-abac-5f65-ac94-87315a866753</subsheetid>
+  <display x="15" y="210" w="60" h="30" />
+  <font family="Segoe UI" size="10" style="Regular" color="000000" />
+  <outputs>
+    <output type="text" name="Trail" friendlyname="Trail" stage="Trail" />
+  </outputs>
+</stage>
+<stage stageid="dc08d403-ca21-5ebe-9f7f-968f609593f3" name="Succeeded? yes to End" type="Anchor">
+  <subsheetid>18fae05c-abac-5f65-ac94-87315a866753</subsheetid>
+  <loginhibit />
+  <display x="150" y="90" w="10" h="10" />
+  <onsuccess>13fccfd3-866e-5f3d-8c19-dbe0d9def812</onsuccess>
+</stage>
+<stage stageid="13fccfd3-866e-5f3d-8c19-dbe0d9def812" name="Succeeded? yes to End (arrive)" type="Anchor">
+  <subsheetid>18fae05c-abac-5f65-ac94-87315a866753</subsheetid>
+  <loginhibit />
+  <display x="150" y="210" w="10" h="10" />
+  <onsuccess>055f82a0-a15a-596c-90a9-6f50bb2ff81b</onsuccess>
+</stage>
+<stage stageid="be258363-1409-5527-bc88-a82c8a27ec35" name="Output Variables" type="Block">
+  <subsheetid>18fae05c-abac-5f65-ac94-87315a866753</subsheetid>
+  <display x="210" y="-60" w="180" h="75" />
+  <font family="Segoe UI" size="10" style="Regular" color="7FB2E5" />
+</stage>
+<stage stageid="6c6148f6-9f90-5884-9f5a-d81f41c4b5f7" name="Trail" type="Data">
+  <subsheetid>18fae05c-abac-5f65-ac94-87315a866753</subsheetid>
+  <display x="300" y="-30" w="120" h="30" />
+  <font family="Segoe UI" size="10" style="Regular" color="000000" />
+  <datatype>text</datatype>
+  <initialvalue></initialvalue>
+  <private />
+  <alwaysinit />
+</stage>
+<stage stageid="804e070c-92f4-5940-8a6d-cf9c3f882023" name="Local Variables" type="Block">
+  <subsheetid>18fae05c-abac-5f65-ac94-87315a866753</subsheetid>
+  <display x="210" y="45" w="180" h="75" />
+  <font family="Segoe UI" size="10" style="Regular" color="7FB2E5" />
+</stage>
+<stage stageid="77bb7193-29bc-50aa-9304-c6ca9f9361a7" name="Error Text" type="Data">
+  <subsheetid>18fae05c-abac-5f65-ac94-87315a866753</subsheetid>
+  <display x="300" y="75" w="120" h="30" />
+  <font family="Segoe UI" size="10" style="Regular" color="000000" />
+  <datatype>text</datatype>
+  <initialvalue></initialvalue>
+  <private />
+  <alwaysinit />
+</stage>
+</process>
