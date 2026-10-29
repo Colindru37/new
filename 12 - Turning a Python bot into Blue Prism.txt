@@ -1,0 +1,94 @@
+12 - TURNING A PYTHON BOT INTO BLUE PRISM
+=========================================
+
+How the five GK Revoke bots were done. Follow the same way for the next.
+
+THE IDEA
+  Do not copy the Python line by line. Copy what it DOES, step by step,
+  and reuse what already exists:
+    GK Revoke Browser     drives Edge; every locator comes from the INI
+    GK Revoke ServiceNow  open task, set state, RCRT list, upload, close
+    GK Revoke Tracker     the Excel trackers (without Excel)
+    GK Revoke Evidence    Word documents with the label
+    GK Revoke Common      email, folders, small logic
+  A new application = ONE new object (like GK Revoke Alice) + a Maker
+  and a Checker process. The INI of the Python bot stays as it is.
+
+THE GK REVOKE XML IS THE REFERENCE
+  The five processes and seven objects ran end to end on UAT. When the
+  Python and the GK Revoke XML disagree on HOW something is done (popups,
+  waits, tables, uploads, labels, failure handling), the XML wins: the
+  Python had the blind spots listed below. Copy its page layout, names
+  and patterns. Change them only for a reason you write down.
+  Do NOT copy these three:
+    - System exceptions marked Retry = True. The failure handler has
+      already reassigned the task, so a retry cannot work (that is why
+      the queues need Max Attempts = 1). New processes: Retry = False.
+    - Row-by-row loops nobody counted yet (BlueSpace groups and teams,
+      the RCRT rows, the Master queue list). Ask the row count first.
+    - What is specific to Alice or BlueSpace pages. Copy the pattern,
+      not the XPaths.
+
+PYTHON  ->  BLUE PRISM
+  main() loop over tickets         process Main page + a work queue
+  a function                       a page
+  class / file for one website     one business object
+  config.ini (ConfigParser)        same INI, Browser > Load Config,
+                                   path in an environment variable
+  driver.get(url)                  Browser > Navigate (URL key)
+  find_element(...).click()        Browser > Click (XPath key)
+  send_keys(text)                  Browser > Send Keys
+  .text / get_attribute            Browser > Get Text / Get Attribute
+  find_elements(...) + len()       Browser > Count Elements
+  WebDriverWait(...).until(...)    Browser > Wait For Element
+  time.sleep(n)                    usually nothing: use Wait For Element
+  switch_to.frame / window         Browser > Switch To Frame / Window
+  execute_script(js)               Browser > Execute Script
+  screenshot                       Browser > Take Screenshot
+  pandas read_excel / to_excel     Tracker > Read Rows / Append Rows /
+                                   Update Field
+  dict / DataFrame / list          a collection
+  for row in ...:                  a loop over a collection
+  if / else                        a decision
+  try / except                     exception stage + Recover / Resume
+                                   (business = the ticket is wrong,
+                                    system = the bot or site failed)
+  outlook / smtplib                Common > Send Email
+  python-docx + label              Evidence > Build Evidence Docs
+  logging                          session log (+ browser log)
+
+THE STEPS
+  1. Read the Python main() and write its steps as a short list
+     ("open task", "download attachment", "for each user: ...").
+  2. Next to each step write which object does it. Most are already
+     there. Only the website-specific steps need the new object.
+  3. Build the new object page by page. Test each page in Object Studio
+     (11 - Debugging, part B) before building the next.
+  4. Build the process: queue loop, then the steps, then failure
+     handling (mark Fail, assign to ops, mark the item Exception).
+  5. Run it on ONE test ticket with Stop After Next Item = True.
+
+WHAT NOT TO COPY FROM THE PYTHON (each one cost us a day)
+  - Code that is commented out, and XPath keys only it used.
+  - Searching for a record in the portal search box: open it by URL.
+  - Column numbers like td[11] in lists the user can personalise:
+    find the column by its header name instead.
+  - Reading a big table row by row (one user had 1078 roles): read the
+    whole table in one Execute Script call.
+  - Fixed sleeps: wait for the element instead.
+  - Code stages inside a PROCESS: Blue Prism cannot run them there. Put
+    the logic in an object action.
+  - Blind spots of the Python: no popup handling, hidden file inputs,
+    header rows in tables. Look at the real page (F12) before trusting
+    an XPath.
+
+ASK BEFORE YOU BUILD
+  How many rows can that table have? Does the site show popups? Which
+  ServiceNow list views does the bot account see? Is there a label
+  policy on Word documents? The answers change the design.
+
+WITH AN AI
+  Give it docs\DEV_PROMPT_python_to_bp.md, the rpa-bp skill, the Python
+  bot with its config.ini and the xml\ folder, then paste the prompt from
+  section 4 of that file. It tells the AI that the GK Revoke XML is the
+  absolute reference and what to ask you before building.
