@@ -1,1 +1,2 @@
-
+python selftest.py
+powershell -ExecutionPolicy Bypass -File core\RadarDiscoverSelfTest.ps1
