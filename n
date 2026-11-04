@@ -1,1 +1,1 @@
-& "C:\Program Files\Blue Prism Limited\Blue Prism Automate\Automate.exe" /resourcepc /public /port 8181 /user <user> <password>
+the [key types]/[types by keyword] blocks for CompoundLoggingEngine, BluePrismProcess, RunnerRecord, RunnerRecordList (or whatever holds runners), clsListener, LogInfo, IProcessLogContext/LogContext, ProcessStage, DataStage, CollectionStage, ProcessValue, ArgumentList/Argument, Session. Copied text beats photos; the 76k-char file on your screen suggests the sections are copyable.
