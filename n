@@ -1,2 +1,1 @@
-python selftest.py
-powershell -ExecutionPolicy Bypass -File core\RadarDiscoverSelfTest.ps1
+& "C:\Program Files\Blue Prism Limited\Blue Prism Automate\Automate.exe" /resourcepc /public /port 8181 /user <user> <password>
