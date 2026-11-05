@@ -1,1 +1,5 @@
-the [key types]/[types by keyword] blocks for CompoundLoggingEngine, BluePrismProcess, RunnerRecord, RunnerRecordList (or whatever holds runners), clsListener, LogInfo, IProcessLogContext/LogContext, ProcessStage, DataStage, CollectionStage, ProcessValue, ArgumentList/Argument, Session. Copied text beats photos; the 76k-char file on your screen suggests the sections are copyable.
+- The session identity: session id, resource name, the process name and version as Blue Prism knows them, so the folder maps to the Control Room row without guessing from time.
+- The work queue item, if the process holds one: item id and its data, because that is the business key the team searches for.
+- The exception's full path up the chain: which object threw first, which pages rethrew, where it was finally caught. The stage log already contains it, but a three-line summary at the top saves reading.
+- The element the failing stage was looking for: the application model entry with its match attributes, so an "element not found" names what was expected. That is the piece that pairs with the UI tree dump later.
+- Timing: stage durations in the stage log, so slowness shows without a stopwatch.
