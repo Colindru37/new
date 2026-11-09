@@ -1,1 +1,0 @@
-node bluewindow.js render "C:\exports\BPA Process - X.xml" --out C:\bw --with C:\exports --bp "C:\Program Files\Blue Prism Limited\Blue Prism Automate"
