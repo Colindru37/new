@@ -1,0 +1,1 @@
+$t = [IO.File]::ReadAllText("C:\path\to\file.bprelease"); $i = $t.IndexOf("</process>"); $t.Substring(0,1200); "`n=== around the first member end ==="; $t.Substring([Math]::Max(0,$i-200), 700)
